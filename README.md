@@ -36,5 +36,6 @@ cp .env.example .env   # then fill in your API key
 ```text
 agents/
 ├── frontmatter.py   # YAML frontmatter parser for memory and skill files
+├── memory.py        # Per-project long-term memory with relevance-based recall
 └── ui.py            # Terminal UI: colored output, spinner, tool display
 ```
