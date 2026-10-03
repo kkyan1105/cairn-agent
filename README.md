@@ -39,5 +39,6 @@ cp .env.example .env   # then fill in your API key
 agents/
 ├── frontmatter.py   # YAML frontmatter parser for memory and skill files
 ├── memory.py        # Per-project long-term memory with relevance-based recall
+├── tools.py         # Built-in tools (file I/O, edit, search, shell) and permission checks
 └── ui.py            # Terminal UI: colored output, spinner, tool display
 ```
