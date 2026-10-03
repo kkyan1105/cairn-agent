@@ -54,7 +54,7 @@ def _project_hash() -> str:
 
 def get_memory_dir() -> Path:
     """Return the current project's memory directory, creating it if missing."""
-    d = Path.home() / ".BearCode" / "projects" / _project_hash() / "memory"
+    d = Path.home() / ".cairn" / "projects" / _project_hash() / "memory"
     d.mkdir(parents=True, exist_ok=True)
     return d
 

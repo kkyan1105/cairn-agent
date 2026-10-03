@@ -1,6 +1,8 @@
-# Bear Agent
+# Cairn
 
-Bear Agent is a self-evolving coding agent harness written in Python.
+Cairn is a self-evolving coding agent harness written in Python.
+
+Like the stone stacks hikers leave to guide those who follow, Cairn turns what it learns from each task into reusable skills for the next one.
 
 The model reasons and proposes tool calls. The harness does everything else: it checks permissions, executes tools, feeds results back to the model, manages context, and turns experience into reusable skills.
 

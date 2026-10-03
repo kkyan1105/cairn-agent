@@ -23,8 +23,8 @@ venv/
 .DS_Store
 
 # Local runtime state
-.bear/sessions/
-.bear/skill-evolution/
+.cairn/sessions/
+.cairn/skill-evolution/
 .playwright-mcp/
 *.log
 
