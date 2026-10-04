@@ -36,9 +36,12 @@ cp .env.example .env   # then fill in your API key
 ## Project layout
 
 ```text
+.cairn/skills/       # Project-level skills (example: code_review)
 agents/
 ├── frontmatter.py   # YAML frontmatter parser for memory and skill files
 ├── memory.py        # Per-project long-term memory with relevance-based recall
+├── skill_evolution.py  # Skill persistence, version snapshots, usage stats, and pruning
+├── skills.py        # Skill loading, retrieval, and prompt rendering
 ├── tools.py         # Built-in tools (file I/O, edit, search, shell) and permission checks
 └── ui.py            # Terminal UI: colored output, spinner, tool display
 ```
