@@ -6,7 +6,6 @@ Like the stone stacks hikers leave to guide those who follow, Cairn turns what i
 
 The model reasons and proposes tool calls. The harness does everything else: it checks permissions, executes tools, feeds results back to the model, manages context, and turns experience into reusable skills.
 
-> **Status:** early development. The project is being built module by module, and this README will grow with it.
 
 ## Planned features
 
