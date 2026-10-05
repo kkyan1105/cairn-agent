@@ -39,8 +39,10 @@ cp .env.example .env   # then fill in your API key
 agents/
 ├── frontmatter.py   # YAML frontmatter parser for memory and skill files
 ├── memory.py        # Per-project long-term memory with relevance-based recall
+├── prompt.py        # Dynamic system prompt assembly (environment, rules, memory, skills, agents)
 ├── skill_evolution.py  # Skill persistence, version snapshots, usage stats, and pruning
 ├── skills.py        # Skill loading, retrieval, and prompt rendering
+├── subagent.py      # Built-in and custom sub-agent definitions with scoped tool sets
 ├── tools.py         # Built-in tools (file I/O, edit, search, shell) and permission checks
 └── ui.py            # Terminal UI: colored output, spinner, tool display
 ```
