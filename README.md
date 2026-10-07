@@ -1,5 +1,7 @@
 # Cairn
 
+[![tests](https://github.com/kkyan1105/cairn-agent/actions/workflows/tests.yml/badge.svg)](https://github.com/kkyan1105/cairn-agent/actions/workflows/tests.yml)
+
 Cairn is a self-evolving coding agent harness written in Python.
 
 Like the stone stacks hikers leave to guide those who follow, Cairn turns what it learns from each task into reusable skills for the next one.
@@ -32,6 +34,13 @@ pip install -r requirements.txt
 cp .env.example .env   # then fill in your API key
 ```
 
+## Running tests
+
+```bash
+pip install -r requirements-dev.txt
+python -m pytest
+```
+
 ## Project layout
 
 ```text
@@ -47,4 +56,5 @@ agents/
 ├── subagent.py      # Built-in and custom sub-agent definitions with scoped tool sets
 ├── tools.py         # Built-in tools (file I/O, edit, search, shell) and permission checks
 └── ui.py            # Terminal UI: colored output, spinner, tool display
+tests/               # pytest suite
 ```
