@@ -34,6 +34,23 @@ pip install -r requirements.txt
 cp .env.example .env   # then fill in your API key
 ```
 
+## MCP servers
+
+Cairn includes its own MCP client, which talks JSON-RPC over stdio. Configure servers in `.mcp.json` at the project root. You can also put them under `mcpServers` in `~/.cairn/settings.json` (global) or `.cairn/settings.json` (project). Later sources override earlier ones when names collide.
+
+```json
+{
+  "mcpServers": {
+    "context7": {
+      "command": "npx",
+      "args": ["-y", "@upstash/context7-mcp"]
+    }
+  }
+}
+```
+
+Each discovered tool is exposed to the model as `mcp__<server>__<tool>`. A server that fails to start or respond within 15 seconds is skipped, and the other servers keep working.
+
 ## Running tests
 
 ```bash
