@@ -47,6 +47,7 @@ python -m pytest
 .cairn/skills/       # Project-level skills (example: code_review)
 agents/
 ├── frontmatter.py   # YAML frontmatter parser for memory and skill files
+├── mcp_client.py    # Stdio JSON-RPC MCP client and tool routing
 ├── memory.py        # Per-project long-term memory with relevance-based recall
 ├── prompt.py        # Dynamic system prompt assembly (environment, rules, memory, skills, agents)
 ├── session.py       # Session save, load, and resume
