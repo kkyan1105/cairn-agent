@@ -34,6 +34,31 @@ pip install -r requirements.txt
 cp .env.example .env   # then fill in your API key
 ```
 
+## Permissions
+
+Every tool call goes through a permission check before it runs. Read-only tools are always allowed. Writing a new file, running a dangerous shell command (such as `rm`, `sudo`, or `git push`), and changing skills all ask for confirmation first.
+
+Permission modes:
+
+| Mode | Behavior |
+|---|---|
+| `default` | Ask before risky actions |
+| `plan` | Read-only. Edits and shell commands are blocked, except writing the plan file |
+| `acceptEdits` | File edits are allowed without asking |
+| `dontAsk` | Anything that would need confirmation is denied |
+| `bypassPermissions` | Everything is allowed |
+
+You can also add allow and deny rules in `~/.cairn/settings.json` or `.cairn/settings.json`. Deny rules are checked first. A trailing `*` matches by prefix.
+
+```json
+{
+  "permissions": {
+    "allow": ["run_shell(npm test*)"],
+    "deny": ["write_file(secrets/*)"]
+  }
+}
+```
+
 ## MCP servers
 
 Cairn includes its own MCP client, which talks JSON-RPC over stdio. Configure servers in `.mcp.json` at the project root. You can also put them under `mcpServers` in `~/.cairn/settings.json` (global) or `.cairn/settings.json` (project). Later sources override earlier ones when names collide.
