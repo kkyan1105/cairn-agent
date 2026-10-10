@@ -10,6 +10,9 @@ TOOLS = [
         "inputSchema": {"type": "object", "properties": {"text": {"type": "string"}}},
     },
     {"name": "fail", "description": "Always returns a JSON-RPC error"},
+    {"name": "noisy", "description": "Writes a lot to stderr before answering"},
+    {"name": "crash", "description": "Exits without answering"},
+    {"name": "hang", "description": "Never answers"},
 ]
 
 
@@ -35,7 +38,15 @@ for line in sys.stdin:
         respond(msg["id"], {"tools": TOOLS})
     elif method == "tools/call":
         name = msg["params"]["name"]
-        if name == "echo":
+        if name == "noisy":
+            sys.stderr.write("log line\n" * 120_000)
+            sys.stderr.flush()
+            respond(msg["id"], {"content": [{"type": "text", "text": "done"}]})
+        elif name == "crash":
+            sys.exit(1)
+        elif name == "hang":
+            continue
+        elif name == "echo":
             text = msg["params"]["arguments"].get("text", "")
             respond(msg["id"], {"content": [{"type": "text", "text": text}, {"type": "image", "data": ""}]})
         else:

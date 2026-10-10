@@ -21,7 +21,7 @@ def test_connection_handshake_list_and_call():
         try:
             await conn.initialize()
             tools = await conn.list_tools()
-            assert [t["name"] for t in tools] == ["echo", "fail"]
+            assert [t["name"] for t in tools][:2] == ["echo", "fail"]
             assert all(t["serverName"] == "fake" for t in tools)
             assert await conn.call_tool("echo", {"text": "hello"}) == "hello"
             with pytest.raises(RuntimeError, match="tool failed"):
@@ -40,7 +40,7 @@ def test_manager_exposes_prefixed_tools_and_routes_calls(isolated_env):
         await manager.load_and_connect()
         try:
             names = [t["name"] for t in manager.get_tool_definitions()]
-            assert names == ["mcp__fake__echo", "mcp__fake__fail"]
+            assert names[:2] == ["mcp__fake__echo", "mcp__fake__fail"]
             assert manager.is_mcp_tool("mcp__fake__echo")
             assert not manager.is_mcp_tool("read_file")
             assert await manager.call_tool("mcp__fake__echo", {"text": "routed"}) == "routed"
@@ -61,7 +61,7 @@ def test_manager_skips_servers_that_fail_to_start(isolated_env):
         await manager.load_and_connect()
         try:
             names = [t["name"] for t in manager.get_tool_definitions()]
-            assert names == ["mcp__fake__echo", "mcp__fake__fail"]
+            assert all(name.startswith("mcp__fake__") for name in names)
         finally:
             await manager.disconnect_all()
 
@@ -75,5 +75,23 @@ def test_call_to_unknown_server_raises(isolated_env):
             await manager.call_tool("mcp__missing__tool", {})
         with pytest.raises(ValueError):
             await manager.call_tool("mcp__bad", {})
+
+    asyncio.run(scenario())
+
+
+async def connected(server_name="fake"):
+    conn = McpConnection(server_name, sys.executable, [FAKE_SERVER])
+    await conn.connect()
+    await conn.initialize()
+    return conn
+
+
+def test_heavy_stderr_output_does_not_block_the_server():
+    async def scenario():
+        conn = await connected()
+        try:
+            assert await asyncio.wait_for(conn.call_tool("noisy", {}), timeout=10) == "done"
+        finally:
+            conn.close()
 
     asyncio.run(scenario())

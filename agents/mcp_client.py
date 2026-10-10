@@ -62,6 +62,8 @@ class McpConnection:
         self._pending: dict[int, asyncio.Future] = {}
         # Background task reading stdout. The MCP Server's responses are read from stdout continuously.
         self._reader_task: asyncio.Task | None = None
+        # Background task draining stderr so a chatty server cannot fill the pipe and block.
+        self._stderr_task: asyncio.Task | None = None
 
     async def connect(self) -> None:
         """Start the MCP Server subprocess and begin reading its stdout in the background."""
@@ -80,6 +82,7 @@ class McpConnection:
         )
         # Keep reading stdout in the background. This must not block connect(), or initialization couldn't continue.
         self._reader_task = asyncio.create_task(self._read_loop())
+        self._stderr_task = asyncio.create_task(self._drain_stderr())
 
     async def _read_loop(self) -> None:
         """Continuously read newline-delimited JSON-RPC responses from the MCP Server's stdout."""
@@ -109,6 +112,19 @@ class McpConnection:
                 else:
                     # For a normal response, only the result part is handed to the caller.
                     fut.set_result(msg.get("result"))
+
+    async def _drain_stderr(self) -> None:
+        """Discard the server's stderr. If nobody reads it, the OS pipe buffer fills up and the server blocks on write."""
+        assert self._process and self._process.stderr
+        try:
+            while True:
+                line = await self._process.stderr.readline()
+                if not line:
+                    break
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            pass
 
     async def _send_request(self, method: str, params: dict | None = None) -> Any:
         """Send a JSON-RPC request and wait for the response with the matching id."""
@@ -186,6 +202,9 @@ class McpConnection:
             # Stop the background stdout reader task.
             self._reader_task.cancel()
             self._reader_task = None
+        if self._stderr_task:
+            self._stderr_task.cancel()
+            self._stderr_task = None
         if self._process:
             try:
                 # Kill the subprocess outright so the external MCP Server doesn't linger.
