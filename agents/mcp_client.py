@@ -87,31 +87,42 @@ class McpConnection:
     async def _read_loop(self) -> None:
         """Continuously read newline-delimited JSON-RPC responses from the MCP Server's stdout."""
         assert self._process and self._process.stdout
-        while True:
-            # MCP stdio usually carries one JSON-RPC message per line.
-            line = await self._process.stdout.readline()
-            if not line:
-                # Reading nothing means the subprocess's stdout is closed, which usually means the process exited.
-                break
-            try:
-                msg = json.loads(line)
-            except json.JSONDecodeError:
-                # Ignore invalid JSON so a single garbage line doesn't break the whole connection.
-                continue
+        try:
+            while True:
+                # MCP stdio usually carries one JSON-RPC message per line.
+                line = await self._process.stdout.readline()
+                if not line:
+                    # Reading nothing means the subprocess's stdout is closed, which usually means the process exited.
+                    break
+                try:
+                    msg = json.loads(line)
+                except json.JSONDecodeError:
+                    # Ignore invalid JSON so a single garbage line doesn't break the whole connection.
+                    continue
 
-            # JSON-RPC responses carry an id; notifications usually don't.
-            msg_id = msg.get("id")
-            if msg_id is not None and msg_id in self._pending:
-                fut = self._pending.pop(msg_id)
-                if "error" in msg:
-                    # When the Server returns a JSON-RPC error, mark the waiting Future as failed.
-                    e = msg["error"]
-                    fut.set_exception(
-                        RuntimeError(f"MCP error {e.get('code')}: {e.get('message')}")
-                    )
-                else:
-                    # For a normal response, only the result part is handed to the caller.
-                    fut.set_result(msg.get("result"))
+                # JSON-RPC responses carry an id; notifications usually don't.
+                msg_id = msg.get("id")
+                if msg_id is not None and msg_id in self._pending:
+                    fut = self._pending.pop(msg_id)
+                    if fut.done():
+                        # The caller already gave up (for example, it timed out or was cancelled).
+                        continue
+                    if "error" in msg:
+                        # When the Server returns a JSON-RPC error, mark the waiting Future as failed.
+                        e = msg["error"]
+                        fut.set_exception(
+                            RuntimeError(f"MCP error {e.get('code')}: {e.get('message')}")
+                        )
+                    else:
+                        # For a normal response, only the result part is handed to the caller.
+                        fut.set_result(msg.get("result"))
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            self._fail_pending(RuntimeError(f"MCP reader failed: {exc}"))
+        else:
+            # The server exited; no response can arrive for requests still in flight.
+            self._fail_pending(RuntimeError(f"MCP server '{self.server_name}' closed"))
 
     async def _drain_stderr(self) -> None:
         """Discard the server's stderr. If nobody reads it, the OS pipe buffer fills up and the server blocks on write."""
@@ -214,9 +225,13 @@ class McpConnection:
                 pass
             self._process = None
         # Once the connection is closed, pending requests can never complete, so explicitly fail them.
-        for fut in self._pending.values():
+        self._fail_pending(RuntimeError(f"MCP server '{self.server_name}' closed"))
+
+    def _fail_pending(self, error: Exception) -> None:
+        """Fail every request still waiting for a response."""
+        for fut in list(self._pending.values()):
             if not fut.done():
-                fut.set_exception(RuntimeError(f"MCP server '{self.server_name}' closed"))
+                fut.set_exception(error)
         self._pending.clear()
 
 

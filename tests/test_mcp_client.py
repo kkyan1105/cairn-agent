@@ -95,3 +95,15 @@ def test_heavy_stderr_output_does_not_block_the_server():
             conn.close()
 
     asyncio.run(scenario())
+
+
+def test_pending_call_fails_when_server_exits():
+    async def scenario():
+        conn = await connected()
+        try:
+            with pytest.raises(RuntimeError, match="closed"):
+                await asyncio.wait_for(conn.call_tool("crash", {}), timeout=5)
+        finally:
+            conn.close()
+
+    asyncio.run(scenario())
