@@ -34,6 +34,27 @@ pip install -r requirements.txt
 cp .env.example .env   # then fill in your API key
 ```
 
+## How the agent loop works
+
+1. Build the system prompt from environment info, git context, project rules, memory, skills, and the available sub-agents.
+2. Send the conversation to the model and stream the response.
+3. For each tool call, check permissions, then execute it. Read-only tools run concurrently.
+4. Feed the tool results back to the model and repeat until it answers without calling a tool.
+5. Save the session automatically. Transient API errors are retried with exponential backoff.
+
+### Context management
+
+Long sessions are kept within the model's context window by a multi-level pipeline:
+
+| Level | Trigger | What it does |
+|---|---|---|
+| Budgeting | Context over 50% full | Truncates oversized tool results, keeping the head and tail |
+| Snipping | Context over 60% full | Replaces stale tool results with a placeholder, keeping the 3 most recent and the latest read of each file |
+| Microcompaction | 5 minutes idle | Clears old tool results that have already been used |
+| Folding | Context over 70% full, or `/compact` | Summarizes history into structured episode, working, and tool memory |
+
+Tool results over 30 KB are saved to `~/.cairn/tool-results/`. Only a preview stays in context.
+
 ## Permissions
 
 Every tool call goes through a permission check before it runs. Read-only tools are always allowed. Writing a new file, running a dangerous shell command (such as `rm`, `sudo`, or `git push`), and changing skills all ask for confirmation first.
