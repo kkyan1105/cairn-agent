@@ -177,7 +177,7 @@ class Agent:
         # Variables for Plan Mode state
         self._pre_plan_mode: str | None=None
         self._plan_file_path: str | None=None
-        self._plan_approval_fn : Callable[[str], Awaitable[bool]] | None=None
+        self._plan_approval_fn : Callable[[str], Awaitable[dict]] | None=None
         self._context_cleared : bool=False
 
         # Thinking mode
@@ -352,7 +352,7 @@ class Agent:
     def set_confirm_fn(self, fn:Callable[[str], Awaitable[bool]]) -> None:
         self.confirm_fn = fn
 
-    def set_plan_approval_fn(self, fn:Callable[[str], Awaitable[bool]]) -> None:
+    def set_plan_approval_fn(self, fn:Callable[[str], Awaitable[dict]]) -> None:
         self._plan_approval_fn = fn
 
 
@@ -1186,10 +1186,10 @@ class Agent:
                 return "Not in plan mode."
             plan_content = "(No plan file found)"
             if self._plan_file_path and Path(self._plan_file_path).exists():
-                plan_content = self._plan_file_path
+                plan_content = Path(self._plan_file_path).read_text(encoding="utf-8")
             # Interactive approval flow (if there is an approval function)
             if self._plan_approval_fn:
-                result = self._plan_approval_fn(plan_content)
+                result = await self._plan_approval_fn(plan_content)
                 choice = result.get("choice", "manual-execute")
 
                 if choice =="keep-planning":
@@ -1208,7 +1208,7 @@ class Agent:
                     target_mode = self._pre_plan_mode or "default"
 
                 # Leave plan mode
-                self._pre_plan_mode = target_mode
+                self.permission_mode = target_mode
                 self._pre_plan_mode = None
                 saved_plan_path = self._plan_file_path
                 self._plan_file_path = None
