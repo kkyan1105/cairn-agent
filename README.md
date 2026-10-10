@@ -57,19 +57,19 @@ Tool results over 30 KB are saved to `~/.cairn/tool-results/`. Only a preview st
 
 ## Permissions
 
-Every tool call goes through a permission check before it runs. Read-only tools are always allowed. Writing a new file, running a dangerous shell command (such as `rm`, `sudo`, or `git push`), and changing skills all ask for confirmation first.
+Every tool call goes through a permission check before it runs. Read-only tools are always allowed. Writing a new file, running a dangerous shell command (such as `rm`, `sudo`, or `git push`), calling an MCP tool, and changing skills all ask for confirmation first.
 
 Permission modes:
 
 | Mode | Behavior |
 |---|---|
 | `default` | Ask before risky actions |
-| `plan` | Read-only. Edits and shell commands are blocked, except writing the plan file |
+| `plan` | Read-only. Edits, shell commands, and MCP tools are blocked, except writing the plan file |
 | `acceptEdits` | File edits are allowed without asking |
 | `dontAsk` | Anything that would need confirmation is denied |
 | `bypassPermissions` | Everything is allowed |
 
-You can also add allow and deny rules in `~/.cairn/settings.json` or `.cairn/settings.json`. Deny rules are checked first. A trailing `*` matches by prefix.
+You can also add allow and deny rules in `~/.cairn/settings.json` or `.cairn/settings.json`. Deny rules are checked first, and plan mode restrictions apply even when an allow rule matches. A trailing `*` matches by prefix.
 
 ```json
 {
@@ -95,7 +95,7 @@ Cairn includes its own MCP client, which talks JSON-RPC over stdio. Configure se
 }
 ```
 
-Each discovered tool is exposed to the model as `mcp__<server>__<tool>`. A server that fails to start or respond within 15 seconds is skipped, and the other servers keep working.
+Each discovered tool is exposed to the model as `mcp__<server>__<tool>`. A server that fails to start or respond within 15 seconds is skipped, and the other servers keep working. If a server crashes mid-call, the call fails right away instead of hanging.
 
 ## Running tests
 
