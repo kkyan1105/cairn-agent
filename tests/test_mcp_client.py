@@ -121,3 +121,16 @@ def test_timed_out_call_is_cleaned_up_and_connection_stays_usable():
             conn.close()
 
     asyncio.run(scenario())
+
+
+def test_close_fails_pending_calls_and_is_idempotent():
+    async def scenario():
+        conn = await connected()
+        call = asyncio.create_task(conn.call_tool("hang", {}))
+        await asyncio.sleep(0.2)
+        conn.close()
+        with pytest.raises(RuntimeError, match="closed"):
+            await call
+        conn.close()
+
+    asyncio.run(scenario())

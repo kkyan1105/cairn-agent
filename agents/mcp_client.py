@@ -225,7 +225,9 @@ class McpConnection:
             self._stderr_task = None
         if self._process:
             try:
-                # Kill the subprocess outright so the external MCP Server doesn't linger.
+                # Close stdin first so a well-behaved server sees EOF, then kill it so it doesn't linger.
+                if self._process.stdin:
+                    self._process.stdin.close()
                 self._process.kill()
             except ProcessLookupError:
                 # kill may raise this if the process has already exited; safe to ignore.
