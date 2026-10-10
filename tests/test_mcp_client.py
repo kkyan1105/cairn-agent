@@ -107,3 +107,17 @@ def test_pending_call_fails_when_server_exits():
             conn.close()
 
     asyncio.run(scenario())
+
+
+def test_timed_out_call_is_cleaned_up_and_connection_stays_usable():
+    async def scenario():
+        conn = await connected()
+        try:
+            with pytest.raises(asyncio.TimeoutError):
+                await asyncio.wait_for(conn.call_tool("hang", {}), timeout=0.5)
+            assert conn._pending == {}
+            assert await asyncio.wait_for(conn.call_tool("echo", {"text": "still alive"}), timeout=5) == "still alive"
+        finally:
+            conn.close()
+
+    asyncio.run(scenario())

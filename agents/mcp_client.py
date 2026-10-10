@@ -152,15 +152,22 @@ class McpConnection:
         #   "params": {...}
         # }
         msg = json.dumps({"jsonrpc": "2.0", "id": req_id, "method": method, "params": params or {}})
-        # The stdio transport uses newlines as message boundaries.
-        self._process.stdin.write((msg + "\n").encode())
-        await self._process.stdin.drain()
 
-        # Create a Future and register it in _pending; _read_loop wakes it when a response with the same id arrives.
-        loop = asyncio.get_event_loop()
-        fut: asyncio.Future = loop.create_future()
+        # Register the Future before writing, so a fast response can never arrive before we are listening.
+        # _read_loop wakes it when a response with the same id arrives.
+        fut: asyncio.Future = asyncio.get_running_loop().create_future()
         self._pending[req_id] = fut
-        return await fut
+        try:
+            # The stdio transport uses newlines as message boundaries.
+            self._process.stdin.write((msg + "\n").encode())
+            await self._process.stdin.drain()
+            return await fut
+        except BaseException:
+            # On timeout, cancellation, or a broken pipe, drop the request so _pending doesn't leak.
+            self._pending.pop(req_id, None)
+            if not fut.done():
+                fut.cancel()
+            raise
 
     def _send_notification(self, method: str, params: dict | None = None) -> None:
         """Send a JSON-RPC notification. Notifications have no id and don't wait for a response."""
