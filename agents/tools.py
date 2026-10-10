@@ -628,6 +628,9 @@ def check_permission(
 
     # Plan mode restrictions come before allow rules, so a broad allow rule cannot bypass read-only planning.
     if mode == "plan":
+        # MCP tools may have side effects we cannot inspect, so they are blocked while planning.
+        if tool_name.startswith("mcp__"):
+            return {"action": "deny", "message": "MCP tools are blocked in plan mode"}
         if tool_name in EDIT_TOOLS:
             file_path = inp.get("file_path") or inp.get("path")
             if plan_file_path and file_path == plan_file_path:
@@ -644,6 +647,12 @@ def check_permission(
 
     if tool_name in ("enter_plan_mode", "exit_plan_mode"):
         return {"action": "allow"}
+
+    # External MCP tools need explicit approval unless an allow rule covers them.
+    if tool_name.startswith("mcp__"):
+        if mode == "dontAsk":
+            return {"action": "deny", "message": "Auto-denied (dontAsk mode): MCP tool call"}
+        return {"action": "confirm", "message": f"MCP tool call: {tool_name}"}
 
     if mode == "acceptEdits" and tool_name in EDIT_TOOLS:
         return {"action": "allow"}

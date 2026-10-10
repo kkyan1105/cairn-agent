@@ -93,3 +93,20 @@ def test_allow_rules_cannot_bypass_plan_mode(isolated_env):
     assert tools.check_permission("run_shell", {"command": "ls"})["action"] == "allow"
     assert tools.check_permission("run_shell", {"command": "ls"}, mode="plan")["action"] == "deny"
     assert tools.check_permission("write_file", {"file_path": "a.py"}, mode="plan")["action"] == "deny"
+
+
+def test_mcp_tools_need_confirmation(isolated_env):
+    result = tools.check_permission("mcp__browser__navigate", {"url": "https://example.com"})
+    assert result == {"action": "confirm", "message": "MCP tool call: mcp__browser__navigate"}
+
+
+def test_mcp_tools_are_denied_in_dont_ask_and_plan_modes(isolated_env):
+    assert tools.check_permission("mcp__docs__search", {}, mode="dontAsk")["action"] == "deny"
+    assert tools.check_permission("mcp__docs__search", {}, mode="plan")["action"] == "deny"
+
+
+def test_allow_rule_can_preapprove_an_mcp_tool(isolated_env):
+    (isolated_env / ".cairn").mkdir()
+    (isolated_env / ".cairn" / "settings.json").write_text(json.dumps({"permissions": {"allow": ["mcp__docs__search"]}}))
+    assert tools.check_permission("mcp__docs__search", {})["action"] == "allow"
+    assert tools.check_permission("mcp__docs__search", {}, mode="plan")["action"] == "deny"
