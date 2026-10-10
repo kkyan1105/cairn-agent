@@ -83,3 +83,13 @@ def test_edit_file_matches_through_curly_quotes(isolated_env):
     result = tools._edit_file({"file_path": str(target), "old_string": 'print("hello")', "new_string": 'print("hi")'})
     assert "quote normalization" in result
     assert target.read_text() == 'print("hi")\n'
+
+
+def test_allow_rules_cannot_bypass_plan_mode(isolated_env):
+    settings = {"permissions": {"allow": ["run_shell", "write_file"]}}
+    (isolated_env / ".cairn").mkdir()
+    (isolated_env / ".cairn" / "settings.json").write_text(json.dumps(settings))
+
+    assert tools.check_permission("run_shell", {"command": "ls"})["action"] == "allow"
+    assert tools.check_permission("run_shell", {"command": "ls"}, mode="plan")["action"] == "deny"
+    assert tools.check_permission("write_file", {"file_path": "a.py"}, mode="plan")["action"] == "deny"

@@ -625,12 +625,8 @@ def check_permission(
     rule_result = _check_permission_rules(tool_name, inp)
     if rule_result == "deny":
         return {"action": "deny", "message": f"Denied by permission rule for {tool_name}"}
-    if rule_result == "allow":
-        return {"action": "allow"}
 
-    if tool_name in READ_TOOLS:
-        return {"action": "allow"}
-
+    # Plan mode restrictions come before allow rules, so a broad allow rule cannot bypass read-only planning.
     if mode == "plan":
         if tool_name in EDIT_TOOLS:
             file_path = inp.get("file_path") or inp.get("path")
@@ -639,6 +635,12 @@ def check_permission(
             return {"action": "deny", "message": f"Blocked in plan mode: {tool_name}"}
         if tool_name == "run_shell":
             return {"action": "deny", "message": "Shell commands blocked in plan mode"}
+
+    if rule_result == "allow":
+        return {"action": "allow"}
+
+    if tool_name in READ_TOOLS:
+        return {"action": "allow"}
 
     if tool_name in ("enter_plan_mode", "exit_plan_mode"):
         return {"action": "allow"}
