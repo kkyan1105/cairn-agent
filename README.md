@@ -88,6 +88,7 @@ python -m pytest
 ```text
 .cairn/skills/       # Project-level skills (example: code_review)
 agents/
+├── agent.py         # Agent runtime: model calls, tool dispatch, context compression
 ├── frontmatter.py   # YAML frontmatter parser for memory and skill files
 ├── mcp_client.py    # Stdio JSON-RPC MCP client and tool routing
 ├── memory.py        # Per-project long-term memory with relevance-based recall
