@@ -246,7 +246,7 @@ class Agent:
         if not self._model_supports_thinking():
             return "disabled"
 
-        if self._mode_supports_adaptive_thinking(self.model):
+        if self._model_supports_adaptive_thinking():
             return "adaptive"
         return "enabled"
 
