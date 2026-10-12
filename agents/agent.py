@@ -190,6 +190,8 @@ class Agent:
 
         self.total_input_tokens = 0
         self.total_output_tokens = 0
+        self.side_input_tokens = 0
+        self.side_output_tokens = 0
         self.last_input_token_count = 0
         self.current_turns = 0
         self.last_api_call_time = 0
@@ -332,6 +334,9 @@ class Agent:
                     model=model, max_tokens=max(1, int(max_tokens)), system=system,
                 messages=[{"role": "user", "content": user_message}],
                 )
+                usage = getattr(resp, "usage", None)
+                self.side_input_tokens += int(getattr(usage, "input_tokens", 0) or 0)
+                self.side_output_tokens += int(getattr(usage, "output_tokens", 0) or 0)
                 text = "".join(b.text for b in resp.content if getattr(b, "type", "") == "text")
                 if not text.strip():
                     block_types = [str(getattr(b, "type", "")) for b in getattr(resp, "content", [])]
@@ -356,6 +361,9 @@ class Agent:
                     ],
 
                 )
+                usage = getattr(resp, "usage", None)
+                self.side_input_tokens += int(getattr(usage, "prompt_tokens", 0) or 0)
+                self.side_output_tokens += int(getattr(usage, "completion_tokens", 0) or 0)
                 if not resp.choices:
                     logging.warning("side_query returned no OpenAI-compatible choices: model=%s", model)
                     return ""
@@ -774,7 +782,7 @@ class Agent:
 
     # Get the current cost
     def _get_current_cost_usd(self) -> float:
-        return (self.total_input_tokens / 1_000_000) * 3 + (self.total_output_tokens / 1_000_000) * 15
+        return ((self.total_input_tokens + self.side_input_tokens) / 1_000_000) * 3 + ((self.total_output_tokens + self.side_output_tokens) / 1_000_000) * 15
 
     # Check the budget
     def _check_budget(self) -> dict:

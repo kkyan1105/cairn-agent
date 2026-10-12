@@ -49,3 +49,29 @@ def test_turn_budget(make_agent):
     assert agent._check_budget()["exceeded"] is False
     agent.current_turns = 2
     assert "Turn limit" in agent._check_budget()["reason"]
+
+
+def test_side_query_tokens_count_toward_cost_budget(make_agent):
+    agent = make_agent(max_cost_usd=0.01)
+    assert agent._check_budget()["exceeded"] is False
+    agent.side_output_tokens = 1_000
+    assert agent._get_current_cost_usd() > 0.01
+    assert agent._check_budget()["exceeded"] is True
+
+
+def test_side_query_records_token_usage(make_agent, monkeypatch):
+    import asyncio
+    from types import SimpleNamespace
+
+    agent = make_agent()
+
+    async def fake_create(**_kwargs):
+        return SimpleNamespace(
+            usage=SimpleNamespace(input_tokens=120, output_tokens=30),
+            content=[SimpleNamespace(type="text", text="picked")],
+        )
+
+    monkeypatch.setattr(agent._anthropic_client.messages, "create", fake_create)
+    side_query = agent._build_side_query()
+    assert asyncio.run(side_query("system", "user")) == "picked"
+    assert (agent.side_input_tokens, agent.side_output_tokens) == (120, 30)
