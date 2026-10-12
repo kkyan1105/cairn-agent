@@ -1761,14 +1761,21 @@ class Agent:
             budget = self._check_budget()
             if budget["exceeded"]:
                 print_info(f"Budget exceeded: {budget['reason']}")
+                self._append_openai_skipped_tool_results(tool_calls, f"Tool execution skipped: {budget['reason']}")
                 break
 
             oai_checked: list[dict] = []
             for tc in tool_calls:
-                if self._aborted:
-                    break
-
                 if tc.get("type") != "function":
+                    continue
+                if self._aborted:
+                    oai_checked.append({
+                        "tc": tc,
+                        "fn": tc.get("function", {}).get("name", ""),
+                        "inp": {},
+                        "allowed": False,
+                        "result": "Tool execution skipped: request aborted.",
+                    })
                     continue
 
                 fn_name = tc["function"]["name"]
@@ -1797,22 +1804,28 @@ class Agent:
                     self._confirmed_paths.add(perm["message"])
                 oai_checked.append({"tc": tc, "fn": fn_name, "inp": inp, "allowed": True})
 
-                oai_batches: list[dict] = []
-                for ct in oai_checked:
-                    safe = ct["allowed"] and ct["fn"] in CONCURRENCY_SAFE_TOOLS
-                    if safe and oai_batches and oai_batches[-1]["concurrent"]:
-                        oai_batches[-1]["items"].append(ct)
-                    else:
-                        oai_batches.append({"concurrent": safe, "items": [ct]})
+            oai_batches: list[dict] = []
+            for ct in oai_checked:
+                safe = ct["allowed"] and ct["fn"] in CONCURRENCY_SAFE_TOOLS
+                if safe and oai_batches and oai_batches[-1]["concurrent"]:
+                    oai_batches[-1]["items"].append(ct)
+                else:
+                    oai_batches.append({"concurrent": safe, "items": [ct]})
 
-                oai_context_break = False
+            oai_context_break = False
+            try:
                 for batch in oai_batches:
                     if oai_context_break or self._aborted:
                         break
 
                     if batch["concurrent"]:
                         async def _run_oai_safe(ct_item: dict) -> tuple[dict, str]:
-                            raw = await self._execute_tool_call(ct_item["fn"], ct_item["inp"])
+                            try:
+                                raw = await self._execute_tool_call(ct_item["fn"], ct_item["inp"])
+                            except asyncio.CancelledError:
+                                raise
+                            except Exception as e:
+                                raw = f"Error executing tool: {e}"
                             raw = _safe_utf8_text(raw)
                             res = self._persist_large_result(ct_item["fn"], raw)
                             print_tool_result(ct_item["fn"], res)
@@ -1833,7 +1846,12 @@ class Agent:
                                     {"role": "tool", "tool_call_id": ct["tc"]["id"], "content": ct["result"]})
                                 continue
 
-                            raw = await self._execute_tool_call(ct["fn"], ct["inp"])
+                            try:
+                                raw = await self._execute_tool_call(ct["fn"], ct["inp"])
+                            except asyncio.CancelledError:
+                                raise
+                            except Exception as e:
+                                raw = f"Error executing tool: {e}"
                             raw = _safe_utf8_text(raw)
                             res = self._persist_large_result(ct["fn"], raw)
                             print_tool_result(ct["fn"], res)
@@ -1850,10 +1868,38 @@ class Agent:
 
                             self._openai_messages.append(
                                 {"role": "tool", "tool_call_id": ct["tc"]["id"], "content": res})
+            except asyncio.CancelledError:
+                self._append_openai_skipped_tool_results(tool_calls, "Tool execution skipped: request aborted.")
+                raise
+
+            if self._aborted:
+                self._append_openai_skipped_tool_results(tool_calls, "Tool execution skipped: request aborted.")
+            elif oai_context_break:
+                self._append_openai_skipped_tool_results(
+                    tool_calls,
+                    "Tool execution skipped because the conversation context was reset.",
+                )
 
             self._context_cleared = False
             self._refresh_runtime_system_prompt()
             await self._check_and_compact()
+
+    def _append_openai_skipped_tool_results(self, tool_calls: list[dict], reason: str) -> None:
+        """Ensure every OpenAI tool_call gets a matching tool message."""
+        existing_ids = {
+            msg.get("tool_call_id")
+            for msg in self._openai_messages
+            if msg.get("role") == "tool"
+        }
+        for tc in tool_calls:
+            if tc.get("type") != "function":
+                continue
+            tool_call_id = tc.get("id")
+            if tool_call_id and tool_call_id not in existing_ids:
+                self._openai_messages.append(
+                    {"role": "tool", "tool_call_id": tool_call_id, "content": reason}
+                )
+                existing_ids.add(tool_call_id)
 
     async def _call_openai_stream(self) -> dict:
         async def _do():
