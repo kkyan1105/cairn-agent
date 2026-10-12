@@ -145,13 +145,39 @@ class Agent:
                  confirm_fn:Callable[[str], Awaitable[bool]] | None=None,
                  custom_system_prompt: str | None=None,
                  custom_tools: list[ToolDef] | None=None,
-                 is_sub_agent: bool=False,):
+                 is_sub_agent: bool=False,
+                 enable_folding: bool=True,
+                 max_fold_limit: int | None=None,
+                 fold_memory_mode: str="single_json",
+                 auto_compact_threshold: float=AUTO_COMPACT_THRESHOLD,
+                 enable_memory_prefetch: bool=True,
+                 enable_mcp: bool=True,
+                 enable_online_evolution: bool=True,
+                 fold_observer: Callable[[dict[str, Any]], None] | None=None,):
+        if not 0 < auto_compact_threshold < 1:
+            raise ValueError("auto_compact_threshold must be between 0 and 1")
+        if max_fold_limit is not None and max_fold_limit < 0:
+            raise ValueError("max_fold_limit must be non-negative")
+        if fold_memory_mode not in {"single_json", "three_parallel"}:
+            raise ValueError("fold_memory_mode must be single_json or three_parallel")
         self.permission_mode = permission_mode
         self.thinking = thinking
         self.model = model
         self.use_openai = bool(api_base)
         self.is_sub_agent = is_sub_agent
-        self.tools = custom_tools or tool_definitions
+        self._api_base = api_base
+        self._anthropic_base_url = anthropic_base_url
+        self._api_key = api_key
+        self.enable_folding = enable_folding
+        self.max_fold_limit = max_fold_limit
+        self.fold_memory_mode = fold_memory_mode
+        self.auto_compact_threshold = auto_compact_threshold
+        self.enable_memory_prefetch = enable_memory_prefetch
+        self.enable_mcp = enable_mcp
+        self.enable_online_evolution = enable_online_evolution
+        self.fold_observer = fold_observer
+        available_tools = tool_definitions if custom_tools is None else custom_tools
+        self.tools = [tool for tool in available_tools if enable_folding or tool["name"] != "compact_context"]
         self.max_cost_usd = max_cost_usd
         self.max_turns = max_turns
         self.confirm_fn = confirm_fn
@@ -398,7 +424,7 @@ class Agent:
 
     async def  chat(self, user_message:str)->None:
         # Lazily load MCP servers on the first chat
-        if not self._mcp_initialized and not self.is_sub_agent:
+        if self.enable_mcp and not self._mcp_initialized and not self.is_sub_agent:
             self._mcp_initialized = True
             try:
                 await self._mcp_manager.load_and_connect()
@@ -474,8 +500,10 @@ class Agent:
             print_assistant_text(text)
 
     def _build_fold_guidance_section(self) -> str:
-        if self._custom_system_prompt is not None:
+        if self._custom_system_prompt is not None or not self.enable_folding:
             return ""
+        if self._fold_limit_reached():
+            return "\n\n# Runtime Fold Guidance\n- Context folding limit reached. Continue without calling `compact_context`.\n"
         utilization = self.last_input_token_count / self.effective_window if self.effective_window else 0.0
         last_fold = "never" if not self._fold_last_time else f"{int((time.time() - self._fold_last_time) / 60)}m ago"
         return (
@@ -588,6 +616,8 @@ class Agent:
         return self.permission_mode in {"bypassPermissions", "acceptEdits"}
 
     def _online_evolution_enabled(self) -> bool:
+        if not self.enable_online_evolution:
+            return False
         raw = os.environ.get("CAIRN_AUTO_SKILL_EVOLUTION", "1").strip().lower()
         return raw not in {"0", "false", "no", "off"}
 
@@ -754,6 +784,9 @@ class Agent:
 
     # Compact the conversation
     async def compact(self)->None:
+        if not self.enable_folding:
+            print_info("Context folding is disabled for this run.")
+            return
         compacted = await self._compact_conversation(trigger="manual")
         if not compacted:
             print_info("Nothing to compact yet.")
@@ -845,11 +878,13 @@ class Agent:
 
     # Auto-compaction
     async def _check_and_compact(self)->None:
-        if self.last_input_token_count > self.effective_window * AUTO_COMPACT_THRESHOLD:
+        if self.enable_folding and not self._fold_limit_reached() and self.last_input_token_count > self.effective_window * self.auto_compact_threshold:
             print_info("Context window filling up, compacting conversation...")
             await self._compact_conversation(trigger="auto")
 
     async def _compact_conversation(self, *, trigger: str = "manual")->bool:
+        if not self.enable_folding or self._fold_limit_reached():
+            return False
         if self.use_openai:
             compacted = await self._compact_openai(trigger=trigger)
         else:
@@ -857,6 +892,9 @@ class Agent:
         if compacted:
             print_info("Conversation compacted.")
         return compacted
+
+    def _fold_limit_reached(self) -> bool:
+        return self.max_fold_limit is not None and self._fold_count >= self.max_fold_limit
 
     async def _compact_anthropic(self, *, trigger: str)->bool:
         if len (self._anthropic_messages)<4:
@@ -1092,6 +1130,8 @@ class Agent:
     # Tool execution entry point
 
     async def _execute_tool_call(self, name: str, inp: dict) -> str:
+        if name not in {tool["name"] for tool in self.tools} and not self._mcp_manager.is_mcp_tool(name):
+            return f"Tool not available in this run: {name}"
         if name == "compact_context":
             return await self._execute_compact_context_tool(inp)
         if name in ("enter_plan_mode", "exit_plan_mode"):
@@ -1114,6 +1154,10 @@ class Agent:
         return result
 
     async def _execute_compact_context_tool(self, inp: dict) -> str:
+        if not self.enable_folding:
+            return "Context folding is disabled for this run. Continue without compacting."
+        if self._fold_limit_reached():
+            return f"Context folding limit reached ({self.max_fold_limit}). Continue without compacting."
         reason = str(inp.get("reason") or "").strip()
         compacted = await self._compact_conversation(trigger="tool")
         if not compacted:
@@ -1294,7 +1338,7 @@ class Agent:
         # Async memory prefetch: only the main agent queries memory; sub-agents don't inject memories.
         # This only starts a background task and doesn't block the current model call.
         memory_prefetch:MemoryPrefetch | None = None
-        if not self.is_sub_agent:
+        if not self.is_sub_agent and self.enable_memory_prefetch:
             sq = self._build_side_query()
             if sq:
                 memory_prefetch = start_memory_prefetch(
@@ -1584,7 +1628,7 @@ class Agent:
 
         # Prefetch handle MemoryPrefetch
         memory_prefetch: MemoryPrefetch | None = None
-        if not self.is_sub_agent:
+        if not self.is_sub_agent and self.enable_memory_prefetch:
             sq = self._build_side_query()
             if sq:
                 memory_prefetch = start_memory_prefetch(
