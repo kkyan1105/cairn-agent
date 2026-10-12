@@ -378,6 +378,7 @@ def evolve_skill_file(
     description: str = "",
     when_to_use: str = "",
     tags: list[str] | None = None,
+    preserve_existing: bool = False,
 ) -> dict[str, Any]:
     skill_file = resolve_skill_file(skill_name, target=target, active_dir=active_dir)
     if not skill_file:
@@ -422,6 +423,9 @@ def evolve_skill_file(
 
     if instructions.strip():
         new_body = _skill_body(instructions.strip())
+        # When merging, keep the existing guidance and append the new instructions instead of replacing them.
+        if preserve_existing and parsed.body.strip() and parsed.body.strip() not in new_body:
+            new_body = parsed.body.rstrip() + "\n\n## Additional guidance from merge\n\n" + new_body.lstrip()
         note = _append_evolution_note("", lesson, rationale).strip()
         if note:
             new_body = new_body.rstrip() + "\n\n" + note + "\n"

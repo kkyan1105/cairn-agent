@@ -345,6 +345,7 @@ def evolve_skill(
     description: str = "",
     when_to_use: str = "",
     tags: list[str] | None = None,
+    preserve_existing: bool = False,
 ) -> dict:
     skill = get_skill_by_name(skill_name)
     result = evolve_skill_file(
@@ -357,6 +358,7 @@ def evolve_skill(
         description=description,
         when_to_use=when_to_use,
         tags=tags,
+        preserve_existing=preserve_existing,
     )
     if result.get("ok"):
         reset_skill_cache()

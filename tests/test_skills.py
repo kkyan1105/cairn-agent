@@ -73,3 +73,34 @@ def test_retrieval_ranks_the_matching_skill_first(isolated_env):
 def test_retrieval_returns_nothing_for_empty_query(isolated_env):
     write_skill(isolated_env / ".cairn" / "skills", "any", "name: any\ndescription: anything")
     assert skills.retrieve_relevant_skills("   ") == []
+
+
+def evolve_with_new_instructions(isolated_env, preserve_existing):
+    write_skill(isolated_env / ".cairn" / "skills", "style", "name: style\ndescription: style guide", "Use tabs.")
+    result = skills.evolve_skill(
+        "style",
+        lesson="Prefer f-strings",
+        instructions="Use f-strings for formatting.",
+        preserve_existing=preserve_existing,
+    )
+    assert result["ok"]
+    return skills.get_skill_by_name("style")
+
+
+def test_evolve_replaces_body_by_default(isolated_env):
+    skill = evolve_with_new_instructions(isolated_env, preserve_existing=False)
+    assert "Use f-strings" in skill.prompt_template
+    assert "Use tabs." not in skill.prompt_template
+
+
+def test_evolve_merge_keeps_existing_guidance(isolated_env):
+    skill = evolve_with_new_instructions(isolated_env, preserve_existing=True)
+    body = skill.prompt_template
+    assert body.index("Use tabs.") < body.index("## Additional guidance from merge") < body.index("Use f-strings")
+
+
+def test_evolve_creates_a_version_snapshot(isolated_env):
+    skill = evolve_with_new_instructions(isolated_env, preserve_existing=True)
+    history = list((isolated_env / ".cairn" / "skill-evolution").rglob("*.jsonl"))
+    assert any("snapshot" in path.read_text() for path in history)
+    assert skill.name == "style"
