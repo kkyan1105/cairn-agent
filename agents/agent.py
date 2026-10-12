@@ -18,6 +18,7 @@ from agents.mcp_client import McpManager
 from agents.memory import MemoryPrefetch, start_memory_prefetch, format_memories_for_injection
 from agents.prompt import build_system_prompt
 from agents.session_memory import (
+    FOLD_COMPONENT_SYSTEMS,
     FOLD_SESSION_MEMORY_SYSTEM,
     build_anthropic_transcript,
     build_folding_user_prompt,
@@ -25,6 +26,7 @@ from agents.session_memory import (
     fallback_folded_memory,
     format_folded_memory,
     parse_folded_memory,
+    parse_fold_component,
 )
 from agents.session import save_folded_session_memory, save_session
 from agents.subagent import get_sub_agent_config
@@ -904,6 +906,7 @@ class Agent:
         if not transcript.strip():
             return False
         memory = await self._generate_folded_session_memory(transcript)
+        self._notify_fold_observer(trigger, transcript, memory)
         self._record_folded_session_memory(trigger, memory)
         self._record_fold_event()
         self._anthropic_messages = [{"role": "user", "content": format_folded_memory(memory)}]
@@ -919,6 +922,7 @@ class Agent:
         if not transcript.strip():
             return False
         memory = await self._generate_folded_session_memory(transcript)
+        self._notify_fold_observer(trigger, transcript, memory)
         self._record_folded_session_memory(trigger, memory)
         self._record_fold_event()
         self._openai_messages=[
@@ -930,6 +934,24 @@ class Agent:
         return True
 
     async def _generate_folded_session_memory(self, transcript: str) -> dict[str, Any]:
+        if self.fold_memory_mode == "three_parallel":
+            side_query = self._build_side_query(max_tokens=2500)
+            if side_query is None:
+                return fallback_folded_memory(transcript)
+            prompt = "Extract the requested memory from this conversation.\n\nConversation transcript:\n" + transcript
+            names = tuple(FOLD_COMPONENT_SYSTEMS)
+            results = await asyncio.gather(
+                *(side_query(FOLD_COMPONENT_SYSTEMS[name], prompt) for name in names),
+                return_exceptions=True,
+            )
+            if any(isinstance(result, BaseException) for result in results):
+                logging.warning("parallel fold memory generation failed; preserving transcript in fallback memory")
+                return fallback_folded_memory(transcript)
+            try:
+                return {name: parse_fold_component(name, raw) for name, raw in zip(names, results)}
+            except (ValueError, TypeError, json.JSONDecodeError):
+                logging.warning("parallel fold memory response was malformed; preserving transcript in fallback memory")
+                return fallback_folded_memory(transcript)
         side_query = self._build_side_query(max_tokens=6000)
         if side_query is None:
             return fallback_folded_memory(transcript)
@@ -939,11 +961,29 @@ class Agent:
         except Exception:
             return fallback_folded_memory(transcript)
 
+    def _notify_fold_observer(self, trigger: str, transcript: str, memory: dict[str, Any]) -> None:
+        if self.fold_observer is None:
+            return
+        try:
+            self.fold_observer({
+                "trigger": trigger,
+                "fold_memory_mode": self.fold_memory_mode,
+                "transcript": transcript,
+                "memory": memory,
+                "pre_fold_input_tokens": self.last_input_token_count,
+            })
+        except Exception:
+            logging.exception("fold observer failed")
+
     def _record_folded_session_memory(self, trigger: str, memory: dict[str, Any]) -> None:
         record = {
             "time": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             "trigger": trigger,
+            "fold_memory_mode": self.fold_memory_mode,
             "session_id": self.session_id,
+            "pre_fold_input_tokens": self.last_input_token_count,
+            "effective_window": self.effective_window,
+            "folded_memory_characters": len(format_folded_memory(memory)),
             **memory,
         }
         self._folded_session_memories.append(record)

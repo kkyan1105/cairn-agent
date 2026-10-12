@@ -72,3 +72,62 @@ def test_online_evolution_switch(make_agent, monkeypatch):
     assert make_agent(enable_online_evolution=False)._online_evolution_enabled() is False
     monkeypatch.setenv("CAIRN_AUTO_SKILL_EVOLUTION", "0")
     assert make_agent()._online_evolution_enabled() is False
+
+
+COMPONENT_REPLIES = {
+    "episode_memory": '{"task_description": "fix bug", "key_events": [], "current_progress": "half done"}',
+    "working_memory": '{"immediate_goal": "run tests", "current_challenges": "", "next_actions": []}',
+    "tool_memory": '{"tools_used": [], "derived_rules": ["re-read before editing"]}',
+}
+
+
+def fake_side_query(replies, seen=None):
+    from agents.session_memory import FOLD_COMPONENT_SYSTEMS
+
+    by_system = {FOLD_COMPONENT_SYSTEMS[name]: reply for name, reply in replies.items()}
+
+    async def side_query(system, prompt):
+        if seen is not None:
+            seen.append(system)
+        reply = by_system[system]
+        if isinstance(reply, Exception):
+            raise reply
+        return reply
+
+    return side_query
+
+
+def test_three_parallel_mode_builds_memory_from_three_calls(make_agent, monkeypatch):
+    agent = make_agent(fold_memory_mode="three_parallel")
+    seen = []
+    monkeypatch.setattr(agent, "_build_side_query", lambda **_: fake_side_query(COMPONENT_REPLIES, seen))
+
+    memory = run(agent._generate_folded_session_memory("transcript"))
+
+    assert len(seen) == 3
+    assert memory["episode_memory"]["current_progress"] == "half done"
+    assert memory["tool_memory"]["derived_rules"] == ["re-read before editing"]
+
+
+@pytest.mark.parametrize("broken", [RuntimeError("api down"), '{"immediate_goal": "missing fields"}'])
+def test_three_parallel_mode_falls_back_when_any_call_fails(make_agent, monkeypatch, broken):
+    agent = make_agent(fold_memory_mode="three_parallel")
+    replies = dict(COMPONENT_REPLIES, working_memory=broken)
+    monkeypatch.setattr(agent, "_build_side_query", lambda **_: fake_side_query(replies))
+
+    memory = run(agent._generate_folded_session_memory("the original transcript"))
+
+    assert "without structured JSON" in memory["episode_memory"]["task_description"]
+    assert "the original transcript" in memory["episode_memory"]["current_progress"]
+
+
+def test_fold_observer_receives_events_and_errors_are_contained(make_agent):
+    events = []
+    agent = make_agent(fold_observer=events.append)
+    agent._notify_fold_observer("auto", "t", {"episode_memory": {}})
+    assert events[0]["trigger"] == "auto" and events[0]["fold_memory_mode"] == "single_json"
+
+    def broken_observer(_event):
+        raise RuntimeError("observer bug")
+
+    make_agent(fold_observer=broken_observer)._notify_fold_observer("auto", "t", {})
