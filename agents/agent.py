@@ -1230,6 +1230,9 @@ class Agent:
 
         # fork means this skill doesn't put its prompt back into the current conversation; it starts a sub-agent to complete the task separately.
         if result["context"] == "fork":
+            budget = self._check_budget()
+            if budget["exceeded"]:
+                return f"Skill fork skipped: {budget['reason']}"
             # result["allowed_tools"] - direct access
             tools = (
                 [t for t in self.tools if t["name"] in  result["allowed_tools"] ]
@@ -1240,14 +1243,29 @@ class Agent:
                 else  [t for t in self.tools if t["name"] != "agent"]
             )
 
+            tools = [t for t in tools if t["name"] not in {"enter_plan_mode", "exit_plan_mode"}]
             print_sub_agent_start("skill-fork", inp.get("skill_name", ""))
             sub_agent = Agent(
                 model=self.model,
-                api_base=str(self._openai_client.base_url) if self.use_openai and self._openai_client else None,
+                api_base=self._api_base,
+                anthropic_base_url=self._anthropic_base_url,
+                api_key=self._api_key,
                 custom_system_prompt=result["prompt"],
                 custom_tools=tools,
                 is_sub_agent=True,
-                permission_mode="plan" if self.permission_mode == "plan" else "bypassPermissions",
+                confirm_fn=self.confirm_fn,
+                permission_mode=self.permission_mode,
+                max_cost_usd=(max(0.0, self.max_cost_usd - self._get_current_cost_usd())
+                              if self.max_cost_usd is not None else None),
+                max_turns=(max(0, self.max_turns - self.current_turns)
+                           if self.max_turns is not None else None),
+                enable_folding=self.enable_folding,
+                max_fold_limit=self.max_fold_limit,
+                fold_memory_mode=self.fold_memory_mode,
+                auto_compact_threshold=self.auto_compact_threshold,
+                enable_memory_prefetch=self.enable_memory_prefetch,
+                enable_mcp=self.enable_mcp,
+                enable_online_evolution=self.enable_online_evolution,
             )
             try:
                 sub_result = await sub_agent.run_once(inp.get("args") or "Execute this skill task.")
@@ -1351,6 +1369,9 @@ class Agent:
         self._last_tool_name = ""
 
     async def _execute_agent_tool(self, inp:dict) -> str:
+        budget = self._check_budget()
+        if budget["exceeded"]:
+            return f"Sub-agent skipped: {budget['reason']}"
         agent_type = inp.get("type", "general")
         description = inp.get("description", "sub-agent task")
         prompt = inp.get("prompt", "")
@@ -1360,11 +1381,25 @@ class Agent:
 
         sub_agent = Agent(
             model=self.model,
-            api_base=str(self._openai_client.base_url) if self.use_openai and self._openai_client else None,
+            api_base=self._api_base,
+            anthropic_base_url=self._anthropic_base_url,
+            api_key=self._api_key,
             custom_system_prompt=config["system_prompt"],
-            custom_tools=config["tools"],
+            custom_tools=[t for t in config["tools"] if t["name"] not in {"enter_plan_mode", "exit_plan_mode"}],
             is_sub_agent=True,
-            permission_mode="plan" if self.permission_mode == "plan" else "bypassPermissions",
+            confirm_fn=self.confirm_fn,
+            permission_mode=self.permission_mode,
+            max_cost_usd=(max(0.0, self.max_cost_usd - self._get_current_cost_usd())
+                          if self.max_cost_usd is not None else None),
+            max_turns=(max(0, self.max_turns - self.current_turns)
+                       if self.max_turns is not None else None),
+            enable_folding=self.enable_folding,
+            max_fold_limit=self.max_fold_limit,
+            fold_memory_mode=self.fold_memory_mode,
+            auto_compact_threshold=self.auto_compact_threshold,
+            enable_memory_prefetch=self.enable_memory_prefetch,
+            enable_mcp=self.enable_mcp,
+            enable_online_evolution=self.enable_online_evolution,
         )
         try:
             result = await sub_agent.run_once(prompt)
