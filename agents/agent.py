@@ -1484,22 +1484,8 @@ class Agent:
                 start_spinner()
 
 
-            # Holds tool tasks started early. Key is the tool_use block id returned by Anthropic.
-            early_executions: dict[str, asyncio.Task] = {}
-
-
-            def _on_tool_block(block:dict):
-                # During streaming, as soon as a complete tool_use block arrives, if the tool is concurrency-safe and permitted,
-                # it can start executing early, cutting the idle time spent waiting for the full model response.
-                if block["name"] in CONCURRENCY_SAFE_TOOLS:
-                    perm = check_permission(block["name"], block["input"], self.permission_mode, self._plan_file_path)
-                    if perm["action"]=="allow":
-                        task =asyncio.create_task(self._execute_tool_call(block["name"], block["input"]))
-                        early_executions[block["id"]] = task
-
-
-            # Call the Anthropic streaming API; _on_tool_block fires when a tool block completes during streaming.
-            response = await self._call_anthropic_stream(on_tool_block_complete=_on_tool_block)
+            # Run tools only after the full response succeeds. Streaming requests may be retried, and starting tools early could repeat their side effects.
+            response = await self._call_anthropic_stream()
             if not self.is_sub_agent:
                 stop_spinner()
 
@@ -1556,22 +1542,7 @@ class Agent:
                 inp = dict(tu.input) if hasattr(tu, "items") else tu.input
                 print_tool_call(tu.name, inp)
 
-                # If this tool already started executing during streaming, just wait for it to finish and collect the result.
-                early_task = early_executions.get(tu.id)
-                if early_task:
-                    try:
-                        raw = await early_task
-                    except Exception as e:
-                        raw = f"Error executing tool: {e}"
-                    raw = _safe_utf8_text(raw)
-                    res = self._persist_large_result(tu.name, raw)
-                    print_tool_result(tu.name, res)
-                    self._record_tool_outcome(tu.name, not self._looks_like_tool_failure(tu.name, raw, res))
-                    tool_results.append({"type": "tool_result", "tool_use_id": tu.id, "content": res})
-                    continue
-
-                # For tools not started early, check permissions right before actually executing.
-
+                # Tools run only after the full response and the permission check.
                 perm = check_permission(tu.name, inp, self.permission_mode, self._plan_file_path)
                 if perm["action"] == "deny":
                     # When permission is denied, still return a tool_result so the model knows why the tool call failed.
