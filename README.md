@@ -38,7 +38,7 @@ cp .env.example .env   # then fill in your API key
 
 1. Build the system prompt from environment info, git context, project rules, memory, skills, and the available sub-agents.
 2. Send the conversation to the model and stream the response.
-3. For each tool call, check permissions, then execute it. Read-only tools run concurrently.
+3. Once the full response has arrived, check permissions for each tool call, then execute it. With OpenAI-compatible backends, consecutive read-only tools run concurrently.
 4. Feed the tool results back to the model and repeat until it answers without calling a tool.
 5. Save the session automatically. Transient API errors are retried with exponential backoff.
 
@@ -54,6 +54,19 @@ Long sessions are kept within the model's context window by a multi-level pipeli
 | Folding | Context over 70% full, or `/compact` | Summarizes history into structured episode, working, and tool memory |
 
 Tool results over 30 KB are saved to `~/.cairn/tool-results/`. Only a preview stays in context.
+
+Folding is configurable per agent:
+
+| Option | Default | Effect |
+|---|---|---|
+| `enable_folding` | `True` | Turn folding off entirely, including the `compact_context` tool |
+| `auto_compact_threshold` | `0.70` | Fraction of the context window that triggers automatic folding |
+| `max_fold_limit` | none | Maximum number of folds per session |
+| `fold_memory_mode` | `single_json` | `three_parallel` generates episode, working, and tool memory with three concurrent calls |
+
+### Sub-agents
+
+Sub-agents run with isolated context but inherit the parent's permission mode, confirmation prompt, and remaining cost and turn budget. A sub-agent cannot switch plan mode, and by default it cannot spawn further sub-agents.
 
 ## Permissions
 
