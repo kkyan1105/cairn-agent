@@ -1,5 +1,7 @@
 import json
 
+import pytest
+
 from agents import session, session_memory
 
 
@@ -33,3 +35,21 @@ def test_fallback_and_format_produce_reinjectable_text():
     text = session_memory.format_folded_memory(memory)
     assert text.startswith("<session-folded-memory>")
     assert "refactor main.py" in text
+
+
+def test_parse_fold_component_accepts_bare_or_wrapped_objects():
+    bare = json.dumps({"immediate_goal": "fix test", "current_challenges": "", "next_actions": []})
+    wrapped = json.dumps({"working_memory": json.loads(bare)})
+    assert session_memory.parse_fold_component("working_memory", bare)["immediate_goal"] == "fix test"
+    assert session_memory.parse_fold_component("working_memory", wrapped)["immediate_goal"] == "fix test"
+
+
+def test_parse_fold_component_rejects_missing_fields_and_unknown_names():
+    with pytest.raises(ValueError, match="missing fields"):
+        session_memory.parse_fold_component("tool_memory", json.dumps({"tools_used": []}))
+    with pytest.raises(ValueError, match="unknown fold component"):
+        session_memory.parse_fold_component("other_memory", "{}")
+
+
+def test_every_component_has_a_system_prompt():
+    assert set(session_memory.FOLD_COMPONENT_SYSTEMS) == {"episode_memory", "working_memory", "tool_memory"}
