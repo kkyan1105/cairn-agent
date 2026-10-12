@@ -207,7 +207,7 @@ class Agent:
         # Variables for Plan Mode state
         self._pre_plan_mode: str | None=None
         self._plan_file_path: str | None=None
-        self._plan_approval_fn : Callable[[str], Awaitable[dict]] | None=None
+        self._plan_approval_fn : Callable[[str], Awaitable[dict[str, Any]]] | None=None
         self._context_cleared : bool=False
 
         # Thinking mode
@@ -388,7 +388,7 @@ class Agent:
     def set_confirm_fn(self, fn:Callable[[str], Awaitable[bool]]) -> None:
         self.confirm_fn = fn
 
-    def set_plan_approval_fn(self, fn:Callable[[str], Awaitable[dict]]) -> None:
+    def set_plan_approval_fn(self, fn:Callable[[str], Awaitable[dict[str, Any]]]) -> None:
         self._plan_approval_fn = fn
 
 
@@ -398,7 +398,7 @@ class Agent:
                1. Exit plan mode (switch from plan back to the original mode)
                When the current mode is already plan, the if branch runs:
                Restore the previous state: self.permission_mode = self._pre_plan_mode or "default".
-                       On entering plan mode, the original mode is saved in _pre_plan_mode. On exit it is assigned back, restoring the state from before the switch.
+                   On entering plan mode, the original mode is saved in _pre_plan_mode. On exit it is assigned back, restoring the state from before the switch.
                Clear plan mode traces: reset _pre_plan_mode and _plan_file_path (the plan file path), and restore _system_prompt to the base _base_system_prompt.
                Sync OpenAI messages: if the OpenAI API is used underneath, also update the first system prompt in the message list so the AI's context switches back too.
                Feedback: print an exit notice and return the restored mode name.
@@ -424,6 +424,7 @@ class Agent:
             self.permission_mode = "plan"
             self._plan_file_path = self._generate_plan_file_path()
             self._system_prompt = self._base_system_prompt + self._build_plan_mode_prompt()
+            self._refresh_runtime_system_prompt()
             print_info(f"Entered plan mode. Plan file: {self._plan_file_path}")
             return "plan"
 
@@ -1296,7 +1297,10 @@ class Agent:
                 return "Not in plan mode."
             plan_content = "(No plan file found)"
             if self._plan_file_path and Path(self._plan_file_path).exists():
-                plan_content = Path(self._plan_file_path).read_text(encoding="utf-8")
+                try:
+                    plan_content = Path(self._plan_file_path).read_text(encoding="utf-8")
+                except Exception as exc:
+                    plan_content = f"(Unable to read plan file: {exc})\n\nPlan file: {self._plan_file_path}"
             # Interactive approval flow (if there is an approval function)
             if self._plan_approval_fn:
                 result = await self._plan_approval_fn(plan_content)
@@ -1308,6 +1312,14 @@ class Agent:
                         f"User rejected the plan and wants to keep planning.\n\n"
                         f"User feedback: {feedback}\n\n"
                         f"Please revise your plan based on this feedback. When done, call exit_plan_mode again."
+                    )
+
+                if choice == "plan-only":
+                    self._aborted = True
+                    return (
+                        f"Plan completed. One-shot plan mode does not execute changes.\n\n"
+                        f"Plan file: {self._plan_file_path}\n\n"
+                        f"## Plan:\n{plan_content}"
                     )
 
                 if choice == "clear-and-execute":
@@ -1323,6 +1335,7 @@ class Agent:
                 saved_plan_path = self._plan_file_path
                 self._plan_file_path = None
                 self._system_prompt = self._base_system_prompt
+                self._refresh_runtime_system_prompt()
                 if self.use_openai and self._openai_messages:
                     self._openai_messages[0]["content"] = self._system_prompt
 
@@ -1347,6 +1360,7 @@ class Agent:
             self._pre_plan_mode = None
             self._plan_file_path = None
             self._system_prompt = self._base_system_prompt
+            self._refresh_runtime_system_prompt()
             if self.use_openai and self._openai_messages:
                 self._openai_messages[0]["content"] = self._system_prompt
 

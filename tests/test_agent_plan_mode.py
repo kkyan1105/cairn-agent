@@ -77,3 +77,45 @@ def test_keep_planning_stays_in_plan_mode_with_feedback(make_agent):
 
     assert agent.permission_mode == "plan"
     assert "Add tests" in result
+
+
+def test_plan_only_choice_stops_without_executing(make_agent):
+    agent = make_agent()
+
+    async def plan_only(_plan_content):
+        return {"choice": "plan-only"}
+
+    agent.set_plan_approval_fn(plan_only)
+    enter_plan_with_file(agent, "1. Refactor parser")
+
+    result = run(agent._execute_plan_mode_tool("exit_plan_mode"))
+
+    assert agent._aborted is True
+    assert agent.permission_mode == "plan"
+    assert "does not execute changes" in result and "1. Refactor parser" in result
+
+
+def test_toggle_updates_openai_system_message_on_enter(make_agent):
+    agent = make_agent("openai")
+    agent.toggle_plan_mode()
+    assert "Plan Mode Active" in agent._openai_messages[0]["content"]
+    agent.toggle_plan_mode()
+    assert "Plan Mode Active" not in agent._openai_messages[0]["content"]
+
+
+def test_unreadable_plan_file_is_reported(make_agent):
+    agent = make_agent()
+    seen = []
+
+    async def approve(plan_content):
+        seen.append(plan_content)
+        return {"choice": "manual-execute"}
+
+    agent.set_plan_approval_fn(approve)
+    run(agent._execute_plan_mode_tool("enter_plan_mode"))
+    Path(agent._plan_file_path).write_bytes(b"\xff\xfe invalid utf-8 \xff")
+
+    run(agent._execute_plan_mode_tool("exit_plan_mode"))
+
+    assert seen[0].startswith("(Unable to read plan file")
+    assert agent.permission_mode == "default"
