@@ -9,7 +9,7 @@ Like the stone stacks hikers leave to guide those who follow, Cairn turns what i
 The model reasons and proposes tool calls. The harness does everything else: it checks permissions, executes tools, feeds results back to the model, manages context, and turns experience into reusable skills.
 
 
-## Planned features
+## Features
 
 - **Agent loop**: model request → tool call → permission check → execution → result feedback.
 - **Dual protocol**: works with both OpenAI-compatible and Anthropic-compatible APIs.
