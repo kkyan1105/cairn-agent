@@ -68,6 +68,24 @@ Folding is configurable per agent:
 
 Sub-agents run with isolated context but inherit the parent's permission mode, confirmation prompt, and remaining cost and turn budget. A sub-agent cannot switch plan mode, and by default it cannot spawn further sub-agents.
 
+## Self-evolving skills
+
+Skills are `SKILL.md` playbooks stored in `.cairn/skills/` (project) or `~/.cairn/skills/` (user). For each request, Cairn ranks the available skills against the request with BM25 over each skill's name, description, and when-to-use. The most relevant skills are offered to the model.
+
+After each reply, an online evolution loop runs in the background:
+
+1. **Extract.** A side model reads the latest exchange and the user's follow-up feedback, and proposes at most one reusable skill candidate. User turns are the evidence. One-off details, secrets, and assistant-only claims are rejected.
+2. **Maintain.** A skill-set manager decides whether to **add** a new skill, **merge** the candidate into an existing one (keeping the existing guidance), or **discard** it. Background writes happen only in `acceptEdits` or `bypassPermissions` mode, and every merge saves a version snapshot first.
+3. **Track.** For each retrieved skill, a judge records whether it was relevant and actually used. These statistics drive pruning of skills that keep being retrieved but are never used.
+4. **Evaluate.** `/skill-eval` replays recorded conversations against each skill lineage, scores responses with rules compiled from the skill text, and promotes a new version to champion only if it beats the current champion without adding hard failures.
+
+Control it with environment variables:
+
+```env
+CAIRN_AUTO_SKILL_EVOLUTION=1      # set to 0 to disable
+CAIRN_AUTO_SKILL_TARGET=project   # or "user" to share learned skills across projects
+```
+
 ## Permissions
 
 Every tool call goes through a permission check before it runs. Read-only tools are always allowed. Writing a new file, running a dangerous shell command (such as `rm`, `sudo`, or `git push`), calling an MCP tool, and changing skills all ask for confirmation first.
