@@ -104,3 +104,17 @@ def test_evolve_creates_a_version_snapshot(isolated_env):
     history = list((isolated_env / ".cairn" / "skill-evolution").rglob("*.jsonl"))
     assert any("snapshot" in path.read_text() for path in history)
     assert skill.name == "style"
+
+
+def test_chinese_filler_words_do_not_drive_retrieval(isolated_env):
+    base = isolated_env / ".cairn" / "skills"
+    write_skill(base, "report_writing", "name: report_writing\ndescription: 撰写政府工作报告")
+    write_skill(base, "generic_helper", "name: generic_helper\ndescription: 帮我做一下这个")
+
+    hits = skills.retrieve_relevant_skills("请帮我写一份政府工作报告")
+    assert hits and hits[0]["name"] == "report_writing"
+    assert all(h["name"] != "generic_helper" for h in hits)
+
+
+def test_stop_tokens_cover_both_languages():
+    assert {"please", "help", "帮我", "一下"} <= skills._STOP_TOKENS

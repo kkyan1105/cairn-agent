@@ -203,6 +203,22 @@ _STOP_TOKENS = {
     "generate",
     "use",
     "need",
+    # Common Chinese request fillers (character bigrams) that carry no topic signal.
+    "请帮",
+    "帮我",
+    "我做",
+    "做一",
+    "一次",
+    "一下",
+    "这个",
+    "那个",
+    "一个",
+    "用户",
+    "问题",
+    "回答",
+    "生成",
+    "使用",
+    "需要",
 }
 
 
