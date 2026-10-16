@@ -126,6 +126,7 @@ agents/
 ├── frontmatter.py   # YAML frontmatter parser for memory and skill files
 ├── mcp_client.py    # Stdio JSON-RPC MCP client and tool routing
 ├── memory.py        # Per-project long-term memory with relevance-based recall
+├── online_skill_eval.py  # Replay-based evaluation and champion promotion for evolved skills
 ├── online_skill_evolution.py  # Extract skill candidates from live feedback and decide add, merge, or discard
 ├── prompt.py        # Dynamic system prompt assembly (environment, rules, memory, skills, agents)
 ├── session.py       # Session save, load, and resume
