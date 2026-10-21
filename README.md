@@ -44,6 +44,15 @@ cairn --accept-edits --max-cost 0.50 "add tests for the CLI"
 cairn --resume                          # continue the last session
 ```
 
+### Docker
+
+The image includes Node.js and Chromium, so the MCP servers in `.mcp.json` work out of the box.
+
+```bash
+docker build -t cairn .
+docker run -it --rm --env-file .env -v "$PWD":/workspace cairn
+```
+
 Run `cairn --help` for all flags and REPL commands such as `/plan`, `/compact`, `/skills`, and `/skill-eval`. You can also run it without installing it: `python -m agents.main`.
 
 ## How the agent loop works
