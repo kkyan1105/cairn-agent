@@ -142,6 +142,7 @@ python -m pytest
 agents/
 ├── agent.py         # Agent runtime: model calls, tool dispatch, context compression
 ├── frontmatter.py   # YAML frontmatter parser for memory and skill files
+├── main.py          # CLI entry point, argument parsing, and interactive REPL
 ├── mcp_client.py    # Stdio JSON-RPC MCP client and tool routing
 ├── memory.py        # Per-project long-term memory with relevance-based recall
 ├── online_skill_eval.py  # Replay-based evaluation and champion promotion for evolved skills
