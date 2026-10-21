@@ -30,9 +30,21 @@ The model reasons and proposes tool calls. The harness does everything else: it 
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
-pip install -r requirements.txt
+pip install -e .
 cp .env.example .env   # then fill in your API key
 ```
+
+## Usage
+
+```bash
+cairn                                   # interactive REPL
+cairn "find the bug in utils.py and fix it"   # one-shot task
+cairn --plan "how would you refactor the parser?"   # read-only plan, no changes
+cairn --accept-edits --max-cost 0.50 "add tests for the CLI"
+cairn --resume                          # continue the last session
+```
+
+Run `cairn --help` for all flags and REPL commands such as `/plan`, `/compact`, `/skills`, and `/skill-eval`. You can also run it without installing it: `python -m agents.main`.
 
 ## How the agent loop works
 
