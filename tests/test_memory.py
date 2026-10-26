@@ -1,3 +1,5 @@
+import re
+
 from agents import memory
 
 
@@ -11,13 +13,13 @@ def test_memory_dir_is_isolated_per_project(isolated_env, tmp_path, monkeypatch)
 
 def test_save_list_and_index(isolated_env):
     filename = memory.save_memory("Prefers tabs", "Indentation style", "user", "Use tabs.")
-    assert filename == "user_prefers_tabs.md"
+    assert re.fullmatch(r"user_prefers_tabs_[0-9a-f]{8}\.md", filename)
 
     entries = memory.list_memories()
     assert [(e.name, e.type, e.content) for e in entries] == [("Prefers tabs", "user", "Use tabs.")]
 
     index = (memory.get_memory_dir() / "MEMORY.md").read_text()
-    assert "[Prefers tabs](user_prefers_tabs.md)" in index
+    assert f"[Prefers tabs]({filename})" in index
 
 
 def test_delete_memory_updates_index(isolated_env):

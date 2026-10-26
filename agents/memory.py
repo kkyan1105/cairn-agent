@@ -12,24 +12,26 @@ Core ideas:
 from __future__ import annotations
 
 import asyncio
+import codecs
 import hashlib
 import json
+import logging
 import re
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Awaitable, Callable
 
 from .frontmatter import parse_frontmatter, format_frontmatter
-from typing import Callable
+from .storage import atomic_write_text, state_lock
 # A side query is an async function: takes a system prompt and a user prompt, returns the model's text.
-# Typed as Any to avoid imposing a complex Awaitable type constraint at runtime.
-SideQueryFn = Callable[[str, str], Any]  # actually Awaitable[str]
+SideQueryFn = Callable[[str, str], Awaitable[str]]
 
 
 VALID_TYPES = {"user", "feedback", "project", "reference"}
 MAX_INDEX_LINES = 200       # Max lines of MEMORY.md kept before injecting into the system prompt.
 MAX_INDEX_BYTES = 25000     # Max bytes of MEMORY.md kept before injecting into the system prompt.
+_logger = logging.getLogger(__name__)
 
 
 class MemoryEntry:
@@ -68,9 +70,10 @@ def _get_index_path() -> Path:
 
 def _slugify(text: str) -> str:
     """Turn a memory name into a short slug suitable for a filename."""
-    s = re.sub(r"[^a-z0-9]+", "_", text.lower())
+    s = re.sub(r"[^a-z0-9\u4e00-\u9fff]+", "_", text.lower())
     s = s.strip("_")
-    return s[:40]
+    digest = hashlib.sha256(text.encode()).hexdigest()[:8]
+    return f"{s[:31]}_{digest}" if s else digest
 
 
 
@@ -78,50 +81,59 @@ def _slugify(text: str) -> str:
 def list_memories() -> list[MemoryEntry]:
     """Read all memory files of the current project, sorted by modification time, newest first."""
     d = get_memory_dir()
-    entries: list[MemoryEntry] = []
+    entries: list[tuple[float, MemoryEntry]] = []
     for f in sorted(d.glob("*.md")):
         # MEMORY.md is the index, not an actual memory.
         if f.name == "MEMORY.md":
             continue
         try:
-            result = parse_frontmatter(f.read_text())
+            mtime = f.stat().st_mtime
+            result = parse_frontmatter(f.read_text(encoding="utf-8"))
             meta = result.meta
             # Files without name/type are not valid memories.
             if not meta.get("name") or not meta.get("type"):
                 continue
             # Fall back to project for an invalid type so one bad file doesn't break the listing.
             t = meta["type"] if meta["type"] in VALID_TYPES else "project"
-            entries.append(MemoryEntry(
+            entry = MemoryEntry(
                 name=meta["name"],
                 description=meta.get("description", ""),
                 type=t,
                 filename=f.name,
                 content=result.body,
-            ))
-        except Exception:
-            pass
+            )
+            entries.append((mtime, entry))
+        except (OSError, UnicodeError):
+            _logger.warning("Skipping unreadable memory %s", f, exc_info=True)
     # Most recently modified memories first, for /memory display.
-    entries.sort(key=lambda e: (d / e.filename).stat().st_mtime, reverse=True)
-    return entries
+    entries.sort(key=lambda item: item[0], reverse=True)
+    return [entry for _, entry in entries]
 
 
 def save_memory(name: str, description: str, type: str, content: str) -> str:
     """Save a memory and refresh the MEMORY.md index."""
+    if type not in VALID_TYPES:
+        raise ValueError("invalid memory type")
     d = get_memory_dir()
     filename = f"{type}_{_slugify(name)}.md"
     text = format_frontmatter({"name": name, "description": description, "type": type}, content)
-    (d / filename).write_text(text)
-    _update_memory_index()
+    with state_lock(d / "MEMORY.md"):
+        atomic_write_text(d / filename, text)
+        _update_memory_index()
     return filename
 
 
 def delete_memory(filename: str) -> bool:
     """Delete a memory by filename and refresh the index on success."""
-    filepath = get_memory_dir() / filename
-    if not filepath.exists():
-        return False
-    filepath.unlink()
-    _update_memory_index()
+    directory = get_memory_dir()
+    filepath = (directory / filename).resolve()
+    if filepath.parent != directory.resolve() or filepath.name == "MEMORY.md":
+        raise ValueError("memory filename must identify a single memory inside its directory")
+    with state_lock(directory / "MEMORY.md"):
+        if not filepath.exists():
+            return False
+        filepath.unlink()
+        _update_memory_index()
     return True
 
 
@@ -133,7 +145,7 @@ def _update_memory_index() -> None:
     lines = ["# Memory Index", ""]
     for m in memories:
         lines.append(f"- **[{m.name}]({m.filename})** ({m.type}) — {m.description}")
-    _get_index_path().write_text("\n".join(lines))
+    atomic_write_text(_get_index_path(), "\n".join(lines))
 
 
 def load_memory_index() -> str:
@@ -146,7 +158,7 @@ def load_memory_index() -> str:
     if len(lines) > MAX_INDEX_LINES:
         content = "\n".join(lines[:MAX_INDEX_LINES]) + "\n\n[... truncated, too many memory entries ...]"
     if len(content.encode()) > MAX_INDEX_BYTES:
-        content = content[:MAX_INDEX_BYTES] + "\n\n[... truncated, index too large ...]"
+        content = content.encode()[:MAX_INDEX_BYTES].decode(errors="ignore") + "\n\n[... truncated, index too large ...]"
     return content
 
 
@@ -167,36 +179,70 @@ class MemoryHeader:
 
 
 MAX_MEMORY_FILES = 200                    # Max number of memory files considered for recall.
+MAX_MEMORY_HEADER_BYTES = 16 * 1024       # Prevents unbounded reads on very long lines or a missing closing delimiter.
+MAX_MEMORY_HEADER_LINES = 30
 MAX_MEMORY_BYTES_PER_FILE = 4096          # Max bytes of a single memory before injection.
 MAX_SESSION_MEMORY_BYTES = 60 * 1024      # Max total memory bytes injected per session.
+
+
+def _read_memory_header(path: Path) -> str:
+    """Read only a bounded frontmatter prefix, stopping at its closing delimiter."""
+    lines: list[bytes] = []
+    remaining = MAX_MEMORY_HEADER_BYTES
+    with path.open("rb") as stream:
+        for index in range(MAX_MEMORY_HEADER_LINES):
+            line = stream.readline(remaining)
+            if not line:
+                break
+            lines.append(line)
+            remaining -= len(line)
+            if (index == 0 and line.strip() != b"---") or (index > 0 and line.strip() == b"---"):
+                break
+            if not remaining:
+                break
+    # A prefix may end inside a UTF-8 character; invalid interior bytes still fail.
+    return codecs.getincrementaldecoder("utf-8")().decode(b"".join(lines), final=remaining > 0)
+
+
+def _read_memory_content(path: Path) -> str:
+    """Read at most the injection budget plus one byte to detect truncation."""
+    with path.open("rb") as stream:
+        raw = stream.read(MAX_MEMORY_BYTES_PER_FILE + 1)
+    return codecs.getincrementaldecoder("utf-8")().decode(
+        raw[:MAX_MEMORY_BYTES_PER_FILE], final=len(raw) <= MAX_MEMORY_BYTES_PER_FILE)
 
 
 def scan_memory_headers() -> list[MemoryHeader]:
     """Quickly scan memory file headers without reading full bodies, for low-cost recall filtering."""
     d = get_memory_dir()
-    headers: list[MemoryHeader] = []
+    files: list[tuple[float, Path]] = []
     for f in d.glob("*.md"):
         if f.name == "MEMORY.md":
             continue
         try:
-            stat = f.stat()
-            raw = f.read_text()
-            # Only parse the first 30 lines; the frontmatter normally fits at the top of the file.
-            first30 = "\n".join(raw.split("\n")[:30])
-            result = parse_frontmatter(first30)
+            files.append((f.stat().st_mtime, f))
+        except OSError:
+            _logger.warning("Skipping unavailable memory %s", f, exc_info=True)
+    files.sort(key=lambda item: item[0], reverse=True)
+    headers: list[MemoryHeader] = []
+    for mtime, f in files:
+        try:
+            result = parse_frontmatter(_read_memory_header(f))
             meta = result.meta
             t = meta.get("type")
             headers.append(MemoryHeader(
                 filename=f.name,
                 file_path=str(f),
-                mtime_ms=stat.st_mtime * 1000,
+                mtime_ms=mtime * 1000,
                 description=meta.get("description"),
                 type=t if t in VALID_TYPES else None,
             ))
-        except Exception:
-            pass
-    headers.sort(key=lambda h: h.mtime_ms, reverse=True)
-    return headers[:MAX_MEMORY_FILES]
+        except (OSError, UnicodeError):
+            _logger.warning("Skipping unreadable memory header %s", f, exc_info=True)
+            continue
+        if len(headers) >= MAX_MEMORY_FILES:
+            break
+    return headers
 
 
 def format_memory_manifest(headers: list[MemoryHeader]) -> str:
@@ -309,11 +355,12 @@ async def select_relevant_memories(
 
         result: list[RelevantMemory] = []
         for h in selected:
-            # Read the content of each selected memory file.
-            content = Path(h.file_path).read_text()
-            # Truncate oversized files so a single memory doesn't take up too much context.
-            if len(content.encode()) > MAX_MEMORY_BYTES_PER_FILE:
-                content = content[:MAX_MEMORY_BYTES_PER_FILE] + "\n\n[... truncated, memory file too large ...]"
+            try:
+                content = _read_memory_content(Path(h.file_path))
+            except (OSError, UnicodeError):
+                # Files may disappear or change while the side query is running.
+                _logger.warning("Skipping unreadable recalled memory %s", h.file_path, exc_info=True)
+                continue
 
             # Build a header from the memory's modification time; old memories get a freshness warning.
             freshness = memory_freshness_warning(h.mtime_ms)
@@ -363,7 +410,7 @@ def start_memory_prefetch(
     """
 
     # Only multi-word input triggers memory prefetch, so short commands don't each cost a side query.
-    if not re.search(r"\s", query.strip()):
+    if not re.search(r"\s", query.strip()) and len(re.findall(r"[\u4e00-\u9fff]", query)) < 6:
         return None
 
     # This session's memory usage must stay within budget.

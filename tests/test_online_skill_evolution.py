@@ -73,11 +73,12 @@ def test_ingest_adds_a_new_project_skill(isolated_env):
     assert len(calls) == 2
 
 
-def test_ingest_merge_keeps_existing_guidance(isolated_env):
+def test_ingest_merge_writes_merged_body_and_snapshots_the_old_one(isolated_env):
     skill_dir = isolated_env / ".cairn" / "skills" / "commit_style"
     skill_dir.mkdir(parents=True)
     (skill_dir / "SKILL.md").write_text("---\nname: commit_style\ndescription: Commit conventions\n---\n\nReference the issue number.")
-    decision = {"action": "merge", "target_skill": "commit_style", "merged_instructions": "Keep subjects under 60 characters."}
+    decision = {"action": "merge", "target_skill": "commit_style",
+                "merged_instructions": "Reference the issue number. Keep subjects under 60 characters."}
     side_query, _ = scripted(json.dumps({"skills": [CANDIDATE]}), json.dumps(decision))
 
     result = run(evo.online_ingest(messages=messages(), side_query=side_query))
@@ -85,6 +86,8 @@ def test_ingest_merge_keeps_existing_guidance(isolated_env):
     assert result["action"] == "merge" and result["ok"]
     body = (skill_dir / "SKILL.md").read_text()
     assert "Reference the issue number." in body and "under 60 characters" in body
+    history = "".join(p.read_text() for p in (isolated_env / ".cairn" / "skill-evolution").rglob("*.jsonl"))
+    assert '"event": "snapshot"' in history
 
 
 def test_ingest_respects_denied_write_confirmation(isolated_env):

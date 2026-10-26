@@ -7,12 +7,16 @@ from agents import session, session_memory
 
 def test_save_load_and_latest(isolated_env, tmp_path, monkeypatch):
     monkeypatch.setattr(session, "SESSION_DIR", tmp_path / "sessions")
-    session.save_session("old", {"metadata": {"id": "old", "startTime": "2026-01-01T00:00:00"}})
-    session.save_session("new", {"metadata": {"id": "new", "startTime": "2026-02-01T00:00:00"}})
+    cwd = str(isolated_env)
+    session.save_session("old", {"metadata": {"id": "old", "cwd": cwd, "startTime": "2026-01-01T00:00:00"}})
+    session.save_session("new", {"metadata": {"id": "new", "cwd": cwd, "startTime": "2026-02-01T00:00:00"}})
+    session.save_session("elsewhere", {"metadata": {"id": "elsewhere", "cwd": str(tmp_path), "startTime": "2026-03-01T00:00:00"}})
 
     assert session.load_session("new")["metadata"]["id"] == "new"
     assert session.load_session("missing") is None
+    # Resume only considers sessions started in the current project.
     assert session.get_latest_session_id() == "new"
+    assert session.load_session("../escape") is None
 
 
 def test_parse_folded_memory_extracts_json_from_noise():

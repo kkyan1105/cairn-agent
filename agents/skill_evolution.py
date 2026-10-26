@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from .frontmatter import format_frontmatter, parse_frontmatter
+from .storage import append_jsonl, atomic_write_text, state_lock, write_json
 
 
 USAGE_LOG = "usage.jsonl"
@@ -32,23 +33,18 @@ def _today() -> str:
 
 
 def _append_jsonl(path: Path, row: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a", encoding="utf-8") as f:
-        f.write(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n")
+    append_jsonl(path, row)
 
 
 def _read_json(path: Path, default: Any) -> Any:
     if not path.is_file():
         return default
-    try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
-        return default
+    # Never turn corrupted counters or provenance into a new, empty history.
+    return json.loads(path.read_text(encoding="utf-8"))
 
 
 def _write_json(path: Path, value: Any) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    write_json(path, value)
 
 
 def _safe_skill_slug(name: str) -> str:
@@ -126,9 +122,11 @@ def record_online_skill_provenance(
     retrieved_reference: dict[str, Any] | None = None,
     decision: dict[str, Any] | None = None,
     error: str = "",
+    replay_context: dict[str, Any] | None = None,
 ) -> None:
     row = {
         "event": "online_ingest",
+        "replay_context": dict(replay_context or {}),
         "time": _utc_now(),
         "action": str(action or "none").strip() or "none",
         "skill": str(skill_name or "").strip(),
@@ -149,44 +147,46 @@ def _update_online_provenance_index(row: dict[str, Any]) -> None:
         return
     root = get_evolution_dir()
     path = root / ONLINE_PROVENANCE_INDEX
-    index = _read_json(path, {})
-    item = index.setdefault(
-        skill,
-        {
-            "skill": skill,
-            "source_count": 0,
-            "history_count": 0,
-            "sources": [],
-            "version_timeline": [],
-            "usage": {},
-        },
-    )
-    result = row.get("result") if isinstance(row.get("result"), dict) else {}
-    item["current_version"] = result.get("version") or item.get("current_version", "")
-    item["last_action"] = row.get("action")
-    item["last_time"] = row.get("time")
-    item["last_ok"] = row.get("ok")
-    item["last_error"] = row.get("error", "")
-    item["source_count"] = int(item.get("source_count", 0)) + 1
-    source = {
-        "time": row.get("time"),
-        "action": row.get("action"),
-        "ok": row.get("ok"),
-        "messages": row.get("messages", []),
-        "retrieved_reference": row.get("retrieved_reference", {}),
-        "decision": row.get("decision", {}),
-        "error": row.get("error", ""),
-    }
-    sources = list(item.get("sources") or [])
-    sources.append(source)
-    item["sources"] = sources[-20:]
-    item["history_count"] = len(sources)
-    if result.get("version"):
-        timeline = list(item.get("version_timeline") or [])
-        timeline.append({"time": row.get("time"), "version": result.get("version"), "action": row.get("action")})
-        item["version_timeline"] = timeline[-50:]
-    index[skill] = item
-    _write_json(path, index)
+    with state_lock(path):
+        index = _read_json(path, {})
+        item = index.setdefault(
+            skill,
+            {
+                "skill": skill,
+                "source_count": 0,
+                "history_count": 0,
+                "sources": [],
+                "version_timeline": [],
+                "usage": {},
+            },
+        )
+        result = row.get("result") if isinstance(row.get("result"), dict) else {}
+        item["current_version"] = result.get("version") or item.get("current_version", "")
+        item["last_action"] = row.get("action")
+        item["last_time"] = row.get("time")
+        item["last_ok"] = row.get("ok")
+        item["last_error"] = row.get("error", "")
+        item["source_count"] = int(item.get("source_count", 0)) + 1
+        source = {
+            "replay_context": dict(row.get("replay_context") or {}),
+            "time": row.get("time"),
+            "action": row.get("action"),
+            "ok": row.get("ok"),
+            "messages": row.get("messages", []),
+            "retrieved_reference": row.get("retrieved_reference", {}),
+            "decision": row.get("decision", {}),
+            "error": row.get("error", ""),
+        }
+        sources = list(item.get("sources") or [])
+        sources.append(source)
+        item["sources"] = sources[-20:]
+        item["history_count"] = len(sources)
+        if result.get("version"):
+            timeline = list(item.get("version_timeline") or [])
+            timeline.append({"time": row.get("time"), "version": result.get("version"), "action": row.get("action")})
+            item["version_timeline"] = timeline[-50:]
+        index[skill] = item
+        _write_json(path, index)
 
 
 def _parse_int(value: str | None, default: int = 0) -> int:
@@ -295,6 +295,7 @@ def create_skill_file(
     evidence: str = "",
     actor: str = "agent",
     tags: list[str] | None = None,
+    _prepared_body: str | None = None,
 ) -> dict[str, Any]:
     resolved_name = str(name or "").strip()
     if not resolved_name:
@@ -329,8 +330,9 @@ def create_skill_file(
         meta["allowed-tools"] = tools
 
     skill_dir.mkdir(parents=True, exist_ok=False)
-    body = _skill_body(instructions, evidence)
-    skill_file.write_text(format_frontmatter(meta, body), encoding="utf-8")
+    # Candidate publication supplies the exact body used during evaluation.
+    body = _skill_body(instructions, evidence) if _prepared_body is None else _prepared_body
+    atomic_write_text(skill_file, format_frontmatter(meta, body))
 
     event = {
         "event": "create",
@@ -347,13 +349,13 @@ def create_skill_file(
     return {"ok": True, **event}
 
 
-def _append_evolution_note(body: str, lesson: str, rationale: str = "") -> str:
+def _append_evolution_note(body: str, lesson: str, rationale: str = "", *, evolved_on: str | None = None) -> str:
     lesson = re.sub(r"\s+", " ", str(lesson or "").strip())
     rationale = re.sub(r"\s+", " ", str(rationale or "").strip())
     if not lesson:
         raise ValueError("lesson is required")
 
-    bullet = f"- {_today()}: {lesson}"
+    bullet = f"- {evolved_on if evolved_on is not None else _today()}: {lesson}"
     if rationale:
         bullet += f" Reason: {rationale}"
 
@@ -379,112 +381,147 @@ def evolve_skill_file(
     when_to_use: str = "",
     tags: list[str] | None = None,
     preserve_existing: bool = False,
+    _prepared_body: str | None = None,
 ) -> dict[str, Any]:
     skill_file = resolve_skill_file(skill_name, target=target, active_dir=active_dir)
     if not skill_file:
         return {"ok": False, "error": f"Skill not found: {skill_name}"}
 
-    raw = skill_file.read_text(encoding="utf-8")
-    parsed = parse_frontmatter(raw)
-    meta = dict(parsed.meta)
-    resolved_name = meta.get("name") or skill_file.parent.name
+    with state_lock(skill_file):
+        raw = skill_file.read_text(encoding="utf-8")
+        parsed = parse_frontmatter(raw)
+        meta = dict(parsed.meta)
+        resolved_name = meta.get("name") or skill_file.parent.name
 
-    snapshot = {
-        "time": _utc_now(),
-        "event": "snapshot",
-        "actor": actor,
-        "skill": resolved_name,
-        "file": str(skill_file),
-        "version": meta.get("version", "0.1.0"),
-        "lesson": _preview(lesson, 1200),
-        "rationale": _preview(rationale, 1200),
-        "content": raw,
-    }
-    history_path = get_evolution_dir() / HISTORY_DIR / f"{_safe_skill_slug(resolved_name)}.jsonl"
-    _append_jsonl(history_path, snapshot)
+        snapshot = {
+            "time": _utc_now(),
+            "event": "snapshot",
+            "actor": actor,
+            "skill": resolved_name,
+            "file": str(skill_file),
+            "version": meta.get("version", "0.1.0"),
+            "lesson": _preview(lesson, 1200),
+            "rationale": _preview(rationale, 1200),
+            "content": raw,
+        }
+        history_path = get_evolution_dir() / HISTORY_DIR / f"{_safe_skill_slug(resolved_name)}.jsonl"
+        _append_jsonl(history_path, snapshot)
 
-    meta["name"] = resolved_name
-    meta["version"] = _bump_patch(meta.get("version"))
-    meta["last-evolved"] = _utc_now()
-    meta["evolution-count"] = str(_parse_int(meta.get("evolution-count"), 0) + 1)
-    if description.strip():
-        meta["description"] = re.sub(r"\s+", " ", description.strip())
-    if when_to_use.strip():
-        meta["when-to-use"] = re.sub(r"\s+", " ", when_to_use.strip())
-    if tags:
-        existing_tags = [part.strip() for part in str(meta.get("tags") or "").split(",") if part.strip()]
-        merged_tags = existing_tags[:]
-        for tag in tags:
-            normalized = re.sub(r"\s+", "-", str(tag).strip())
-            if normalized and normalized not in merged_tags:
-                merged_tags.append(normalized)
-        if merged_tags:
-            meta["tags"] = ",".join(merged_tags[:12])
+        meta["name"] = resolved_name
+        meta["version"] = _bump_patch(meta.get("version"))
+        meta["last-evolved"] = _utc_now()
+        meta["evolution-count"] = str(_parse_int(meta.get("evolution-count"), 0) + 1)
+        if description.strip():
+            meta["description"] = re.sub(r"\s+", " ", description.strip())
+        if when_to_use.strip():
+            meta["when-to-use"] = re.sub(r"\s+", " ", when_to_use.strip())
+        if tags:
+            existing_tags = [part.strip() for part in str(meta.get("tags") or "").split(",") if part.strip()]
+            merged_tags = existing_tags[:]
+            for tag in tags:
+                normalized = re.sub(r"\s+", "-", str(tag).strip())
+                if normalized and normalized not in merged_tags:
+                    merged_tags.append(normalized)
+            if merged_tags:
+                meta["tags"] = ",".join(merged_tags[:12])
 
-    if instructions.strip():
-        new_body = _skill_body(instructions.strip())
-        # When merging, keep the existing guidance and append the new instructions instead of replacing them.
-        if preserve_existing and parsed.body.strip() and parsed.body.strip() not in new_body:
-            new_body = parsed.body.rstrip() + "\n\n## Additional guidance from merge\n\n" + new_body.lstrip()
-        note = _append_evolution_note("", lesson, rationale).strip()
-        if note:
-            new_body = new_body.rstrip() + "\n\n" + note + "\n"
-    else:
-        new_body = _append_evolution_note(parsed.body, lesson, rationale)
-    skill_file.write_text(format_frontmatter(meta, new_body), encoding="utf-8")
+        if _prepared_body is not None:
+            new_body = _prepared_body
+        elif instructions.strip():
+            new_body = _skill_body(instructions.strip())
+            # The maintainer supplies a complete merged body. Preserve previous
+            # instructions in the snapshot, not as conflicting active guidance.
+            note = _append_evolution_note("", lesson, rationale).strip()
+            if note:
+                new_body = new_body.rstrip() + "\n\n" + note + "\n"
+        else:
+            new_body = _append_evolution_note(parsed.body, lesson, rationale)
+        atomic_write_text(skill_file, format_frontmatter(meta, new_body))
 
-    event = {
-        "event": "evolve",
-        "time": _utc_now(),
-        "actor": actor,
-        "skill": resolved_name,
-        "file": str(skill_file),
-        "version": meta["version"],
-        "target": target,
-        "lesson": _preview(lesson, 1200),
-        "rationale": _preview(rationale, 1200),
-        "history": str(history_path),
-    }
-    _append_jsonl(get_evolution_dir() / USAGE_LOG, event)
-    return {"ok": True, **event}
+        event = {
+            "event": "evolve",
+            "time": _utc_now(),
+            "actor": actor,
+            "skill": resolved_name,
+            "file": str(skill_file),
+            "version": meta["version"],
+            "target": target,
+            "lesson": _preview(lesson, 1200),
+            "rationale": _preview(rationale, 1200),
+            "history": str(history_path),
+        }
+        _append_jsonl(get_evolution_dir() / USAGE_LOG, event)
+        return {"ok": True, **event}
 
 
-def record_skill_usage_judgments(judgments: list[dict[str, Any]]) -> dict[str, Any]:
+def record_skill_usage_judgments(judgments: list[dict[str, Any]], *, allow_prune: bool = False) -> dict[str, Any]:
+    if any(type(item.get("relevant")) is not bool or type(item.get("used")) is not bool
+           or (item["used"] and not item["relevant"]) for item in judgments):
+        raise ValueError("Skill usage judgments require consistent boolean values")
     stats_path = get_evolution_dir() / SKILL_USAGE_STATS
-    stats = _read_json(stats_path, {})
-    pruned: list[str] = []
-    for judgment in judgments:
-        skill = str(judgment.get("name") or judgment.get("skill") or "").strip()
-        if not skill:
-            continue
-        item = stats.setdefault(
-            skill,
-            {
-                "retrieved": 0,
-                "relevant": 0,
-                "used": 0,
-                "last_retrieved": "",
-                "last_used": "",
-                "source": judgment.get("source", ""),
-                "skill_dir": judgment.get("skill_dir", ""),
-            },
-        )
-        item["retrieved"] = int(item.get("retrieved", 0)) + 1
-        item["last_retrieved"] = _utc_now()
-        item["source"] = judgment.get("source", item.get("source", ""))
-        item["skill_dir"] = judgment.get("skill_dir", item.get("skill_dir", ""))
-        if judgment.get("relevant"):
-            item["relevant"] = int(item.get("relevant", 0)) + 1
-        if judgment.get("used"):
-            item["used"] = int(item.get("used", 0)) + 1
-            item["last_used"] = _utc_now()
-        item["last_reason"] = _preview(judgment.get("reason", ""), 500)
-        item["last_score"] = judgment.get("score", 0)
-        if _maybe_prune_stale_skill(skill, item):
-            pruned.append(skill)
-    _write_json(stats_path, stats)
-    _sync_usage_into_provenance(stats)
-    return {"ok": True, "judgments": len(judgments), "pruned": pruned}
+    with state_lock(stats_path):
+        stats = _read_json(stats_path, {})
+        pruned: list[str] = []
+        for judgment in judgments:
+            skill = str(judgment.get("name") or judgment.get("skill") or "").strip()
+            if not skill:
+                continue
+            item = stats.setdefault(
+                skill,
+                {
+                    "retrieved": 0,
+                    "relevant": 0,
+                    "used": 0,
+                    "last_retrieved": "",
+                    "last_used": "",
+                    "source": judgment.get("source", ""),
+                    "skill_dir": judgment.get("skill_dir", ""),
+                },
+            )
+            item["retrieved"] = int(item.get("retrieved", 0)) + 1
+            item["last_retrieved"] = _utc_now()
+            item["source"] = judgment.get("source", item.get("source", ""))
+            item["skill_dir"] = judgment.get("skill_dir", item.get("skill_dir", ""))
+            if judgment.get("relevant"):
+                item["relevant"] = int(item.get("relevant", 0)) + 1
+            if judgment.get("used"):
+                item["used"] = int(item.get("used", 0)) + 1
+                item["last_used"] = _utc_now()
+            item["last_reason"] = _preview(judgment.get("reason", ""), 500)
+            item["last_score"] = judgment.get("score", 0)
+            if allow_prune and _maybe_prune_stale_skill(skill, item):
+                pruned.append(skill)
+        _write_json(stats_path, stats)
+        _sync_usage_into_provenance(stats)
+        return {"ok": True, "judgments": len(judgments), "pruned": pruned}
+
+
+def restore_pruned_skill(skill_name: str) -> dict[str, Any]:
+    """Restore an archive after the caller has authorized this file operation."""
+    stats_path = get_evolution_dir() / SKILL_USAGE_STATS
+    with state_lock(stats_path):
+        stats = _read_json(stats_path, {})
+        item = stats.get(skill_name, {})
+        if not item.get("pruned") or not item.get("pruned_to") or not item.get("skill_dir"):
+            return {"ok": False, "error": "No archived skill found"}
+        archive = Path(item["pruned_to"]).resolve()
+        original = Path(item["skill_dir"]).resolve()
+        archive_root = (get_evolution_dir() / "pruned").resolve()
+        source_root = _skills_root(item.get("source", "project")).resolve()
+        if archive.parent != archive_root or original.parent != source_root:
+            return {"ok": False, "error": "Archive paths are outside the expected skill directories"}
+        if original.exists() or not (archive / "SKILL.md").is_file():
+            return {"ok": False, "error": "Original path is occupied or archive is missing"}
+        original.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(archive), str(original))
+        item.update(pruned=False, pruned_to="", retrieved=0, relevant=0, used=0,
+                    last_retrieved="", last_used="")
+        _write_json(stats_path, stats)
+        _append_jsonl(get_evolution_dir() / USAGE_LOG,
+                      {"event": "restore", "time": _utc_now(), "skill": skill_name,
+                       "from": str(archive), "to": str(original)})
+        _sync_usage_into_provenance(stats)
+        return {"ok": True, "skill": skill_name, "file": str(original / "SKILL.md")}
 
 
 def _maybe_prune_stale_skill(skill_name: str, stats: dict[str, Any]) -> bool:
@@ -526,16 +563,17 @@ def _maybe_prune_stale_skill(skill_name: str, stats: dict[str, Any]) -> bool:
 
 def _sync_usage_into_provenance(stats: dict[str, Any]) -> None:
     path = get_evolution_dir() / ONLINE_PROVENANCE_INDEX
-    index = _read_json(path, {})
-    if not isinstance(index, dict):
-        return
-    changed = False
-    for skill, usage in stats.items():
-        if skill in index:
-            index[skill]["usage"] = usage
-            changed = True
-    if changed:
-        _write_json(path, index)
+    with state_lock(path):
+        index = _read_json(path, {})
+        if not isinstance(index, dict):
+            return
+        changed = False
+        for skill, usage in stats.items():
+            if skill in index:
+                index[skill]["usage"] = usage
+                changed = True
+        if changed:
+            _write_json(path, index)
 
 
 def load_skill_stats() -> dict[str, dict[str, Any]]:

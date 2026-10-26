@@ -36,6 +36,7 @@ class SkillDefinition:
 
 # Skills are scanned from disk only on first read and cached afterwards; restart or reset after editing a skill.
 _cached_skills: list[SkillDefinition] | None = None
+_cached_skill_signature = None
 
 
 def execute_skill(skill_name:str, args:object)-> dict | None:
@@ -65,7 +66,7 @@ def resolve_skill_prompt(skill: SkillDefinition, args: object) -> str:
     import re
     prompt = skill.prompt_template
     # Supports referencing user arguments via $ARGUMENTS or ${ARGUMENTS} in the SKILL.md body.
-    prompt = re.sub(r"\$ARGUMENTS|\$\{ARGUMENTS\}", str(args or ""), prompt)
+    prompt = re.sub(r"\$ARGUMENTS|\$\{ARGUMENTS\}", lambda _: str(args or ""), prompt)
     # Lets a skill reference its own directory, e.g. to read references/scripts next to it.
     prompt = prompt.replace("${CLAUDE_SKILL_DIR}", skill.skill_dir)
     return prompt
@@ -78,8 +79,18 @@ def get_skill_by_name(skill_name:str)->SkillDefinition | None:
     return None
 
 def discover_skills() -> list[SkillDefinition]:
-    global _cached_skills
-    if _cached_skills is not None:
+    global _cached_skills, _cached_skill_signature
+    roots = [Path.home() / ".cairn" / "skills", Path.cwd() / ".cairn" / "skills"]
+    signature = []
+    for root in roots:
+        for path in sorted(root.glob("*/SKILL.md")):
+            try:
+                info = path.stat()
+                signature.append((str(path.resolve()), info.st_mtime_ns, info.st_size, info.st_ino))
+            except OSError:
+                continue
+    signature = (str(Path.cwd().resolve()), tuple(signature))
+    if _cached_skills is not None and signature == _cached_skill_signature:
         return _cached_skills
 
     skills: dict[str,SkillDefinition] = {}
@@ -91,6 +102,7 @@ def discover_skills() -> list[SkillDefinition]:
     _load_skills_from_dir(project_dir, "project", skills, overwrite=False)
 
     _cached_skills = list(skills.values())
+    _cached_skill_signature = signature
     return _cached_skills
 
 def _load_skills_from_dir( base_dir: Path, source: str, skills:dict[str, SkillDefinition], overwrite: bool = True) -> None:
@@ -161,7 +173,7 @@ def build_skill_descriptions() -> str:
         lines.append("")
     # Skills with user_invocable=True are mainly for users to invoke manually via /<name>.
     invocable = [s for s in skills if s.user_invocable]
-    # Skills with user_invocable=False are auto-invocation candidates; the model decides from when_to_use whether to call the skill tool.
+    # Skills with user_invocable=False are auto-invocation candidates; the model decides whether to call the skill tool based on when_to_use.
     auto_only = [s for s in skills if not s.user_invocable]
 
     if invocable:
@@ -347,7 +359,7 @@ def format_retrieved_skill_context(query: str, *, limit: int = 3) -> tuple[str, 
 
 
 def reset_skill_cache() -> None:
-    # Used to refresh skills in tests or at runtime; regular users can just restart the program.
+    # Used to refresh skills in tests or at runtime; normal users can simply restart the program.
     global _cached_skills
     _cached_skills = None
 
@@ -421,8 +433,10 @@ def record_online_provenance(
     retrieved_reference: dict[str, Any] | None = None,
     decision: dict[str, Any] | None = None,
     error: str = "",
+    replay_context: dict[str, Any] | None = None,
 ) -> None:
     record_online_skill_provenance(
+        replay_context=replay_context,
         action=action,
         skill_name=skill_name,
         result=result,
@@ -441,8 +455,8 @@ def skill_stats() -> str:
     return format_skill_stats()
 
 
-def record_usage_judgments(judgments: list[dict[str, Any]]) -> dict[str, Any]:
-    result = record_skill_usage_judgments(judgments)
+def record_usage_judgments(judgments: list[dict[str, Any]], *, allow_prune: bool = False) -> dict[str, Any]:
+    result = record_skill_usage_judgments(judgments, allow_prune=allow_prune)
     if result.get("pruned"):
         reset_skill_cache()
     return result
