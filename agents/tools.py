@@ -1,274 +1,183 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import asyncio
 import fnmatch
+import hashlib
 import json
 import os
 import re
-import subprocess
+import signal
+import stat
+import uuid
+from dataclasses import dataclass
 from pathlib import Path
-
-from tqdm.utils import IS_WIN
+from typing import Any, Callable, Literal
 
 from agents.memory import get_memory_dir
+from agents.tool_schemas import ToolDef, tool_definitions
+from .tool_status import ToolResult
 
-ToolDef = dict  # Anthropic tool schema dict
-# Permission modes
-PermissionMode = str  # "default" | "plan" | "acceptEdits" | "bypassPermissions" | "dontAsk"
+ToolInput = dict[str, Any]
+SyncToolHandler = Callable[[ToolInput], str]
+PermissionMode = Literal["default", "plan", "acceptEdits", "bypassPermissions", "dontAsk"]
 
 READ_TOOLS = {"read_file", "list_files", "grep_search", "compact_context"}
-EDIT_TOOLS = {"write_file", "edit_file", "skill_evolve", "skill_create"}
+EDIT_TOOLS = {"write_file", "edit_file", "skill_evolve", "skill_create", "skill_prune", "skill_restore", "state_cleanup"}
 
 
 # Concurrency-safe tools can run in parallel (read-only, no side effects)
 CONCURRENCY_SAFE_TOOLS = {"read_file", "list_files", "grep_search"}
 
 
-
-
-
-
-
-def get_active_tool_definitions(all_tools: list[ToolDef] | None = None) -> list[ToolDef]:
-    """Filter and return the currently available tool definitions; mainly used before API calls to drop deferred tools that are not yet activated and strip irrelevant metadata fields."""
-    tools = all_tools if all_tools is not None else tool_definitions
-    return [
-        {k: v for k, v in t.items() if k != "deferred"}
-        for t in tools
-        if not t.get("deferred") or t["name"] in _activated_tools
-    ]
-
-
-
-# Tool definitions
-tool_definitions: list[ToolDef] = [
-    {
-        "name": "read_file",
-        "description": "Read the contents of a file. Returns the file content with line numbers.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "file_path": {"type": "string", "description": "The path to the file to read"},
-            },
-            "required": ["file_path"],
-        },
-    },
-    {
-        "name": "write_file",
-        "description": "Write content to a file. Creates the file if it doesn't exist, overwrites if it does.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "file_path": {"type": "string", "description": "The path to the file to write"},
-                "content": {"type": "string", "description": "The content to write to the file"},
-            },
-            "required": ["file_path", "content"],
-        },
-    },
-    {
-        "name": "edit_file",
-        "description": "Edit a file by replacing an exact string match with new content. The old_string must match exactly (including whitespace and indentation).",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "file_path": {"type": "string", "description": "The path to the file to edit"},
-                "old_string": {"type": "string", "description": "The exact string to find and replace"},
-                "new_string": {"type": "string", "description": "The string to replace it with"},
-            },
-            "required": ["file_path", "old_string", "new_string"],
-        },
-    },
-    {
-        "name": "list_files",
-        "description": "List files matching a glob pattern. Returns matching file paths.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "pattern": {"type": "string", "description": 'Glob pattern to match files (e.g., "**/*.ts", "src/**/*")'},
-                "path": {"type": "string", "description": "Base directory to search from. Defaults to current directory."},
-            },
-            "required": ["pattern"],
-        },
-    },
-    {
-        "name": "grep_search",
-        "description": "Search for a pattern in files. Returns matching lines with file paths and line numbers.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "pattern": {"type": "string", "description": "The regex pattern to search for"},
-                "path": {"type": "string", "description": "Directory or file to search in. Defaults to current directory."},
-                "include": {"type": "string", "description": 'File glob pattern to include (e.g., "*.ts", "*.py")'},
-            },
-            "required": ["pattern"],
-        },
-    },
-    {
-        "name": "run_shell",
-        "description": "Execute a shell command and return its output. Use this for running tests, installing packages, git operations, etc.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "command": {"type": "string", "description": "The shell command to execute"},
-                "timeout": {"type": "number", "description": "Timeout in milliseconds (default: 30000)"},
-            },
-            "required": ["command"],
-        },
-    },
-    {
-        "name": "skill",
-        "description": "Invoke a registered skill by name. Skills are prompt templates loaded from .cairn/skills/. Returns the skill's resolved prompt to follow.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "skill_name": {"type": "string", "description": "The name of the skill to invoke"},
-                "args": {"type": "string", "description": "Optional arguments to pass to the skill"},
-            },
-            "required": ["skill_name"],
-        },
-    },
-    {
-        "name": "compact_context",
-        "description": "Compact the current conversation context into structured session memory when the context is long, tool results are noisy, or a strategy reset is useful. This preserves task progress, current next steps, and tool-use experience, then continues from the folded memory.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "reason": {
-                    "type": "string",
-                    "description": "Brief reason for compacting now, such as long context, many tool calls, repeated failures, or strategy change.",
-                },
-            },
-        },
-    },
-    {
-        "name": "skill_evolve",
-        "description": "Persist an explicit reusable user correction or workflow preference into an existing skill. Creates a version snapshot before editing the skill.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "skill_name": {"type": "string", "description": "The registered skill name to evolve"},
-                "lesson": {"type": "string", "description": "Durable reusable rule to add to the skill"},
-                "rationale": {"type": "string", "description": "Why this lesson should affect future similar tasks"},
-                "target": {
-                    "type": "string",
-                    "enum": ["active", "project", "user"],
-                    "description": "Which skill file to update. Defaults to active.",
-                },
-            },
-            "required": ["skill_name", "lesson"],
-        },
-    },
-    {
-        "name": "skill_create",
-        "description": "Create a new reusable skill from explicit durable workflow guidance when no suitable existing skill exists.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "name": {"type": "string", "description": "Concise reusable skill name"},
-                "description": {"type": "string", "description": "One-sentence description of what the skill does and when to use it"},
-                "instructions": {"type": "string", "description": "Reusable SKILL.md body. Focus on durable method, constraints, and workflow, not one-off task content."},
-                "when_to_use": {"type": "string", "description": "Trigger condition for auto-invocation"},
-                "target": {
-                    "type": "string",
-                    "enum": ["project", "user"],
-                    "description": "Where to create the skill. Defaults to project.",
-                },
-                "context": {
-                    "type": "string",
-                    "enum": ["inline", "fork"],
-                    "description": "Skill execution mode. Defaults to inline.",
-                },
-                "user_invocable": {"type": "boolean", "description": "Whether users can invoke it manually with /<skill>. Defaults to false."},
-                "allowed_tools": {"type": "string", "description": "Optional comma-separated allowed tools for fork mode"},
-                "evidence": {"type": "string", "description": "Short user-provided evidence showing why this is reusable"},
-            },
-            "required": ["name", "description", "instructions"],
-        },
-    },
-    {
-        "name": "enter_plan_mode",
-        "description": "Enter plan mode to switch to a read-only planning phase. In plan mode, you can only read files and write to the plan file.",
-        "input_schema": {"type": "object", "properties": {}},
-        "deferred": True,
-    },
-    {
-        "name": "exit_plan_mode",
-        "description": "Exit plan mode after you have finished writing your plan to the plan file.",
-        "input_schema": {"type": "object", "properties": {}},
-        "deferred": True,
-    },
-    {
-        "name": "agent",
-        "description": "Launch a sub-agent to handle a task autonomously. Sub-agents have isolated context and return their result. Types: 'explore' (read-only), 'plan' (read-only, structured planning), 'general' (full tools).",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "description": {"type": "string", "description": "Short (3-5 word) description of the sub-agent's task"},
-                "prompt": {"type": "string", "description": "Detailed task instructions for the sub-agent"},
-                "type": {"type": "string", "enum": ["explore", "plan", "general"], "description": "Agent type. Default: general"},
-            },
-            "required": ["description", "prompt"],
-        },
-    },
-    # ─── Tool search (deferred tool loader) ─────────────────────
-    {
-        "name": "tool_search",
-        "description": "Search for available tools by name or keyword. Returns full schema definitions for matching deferred tools so you can use them.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "query": {"type": "string", "description": "Tool name or search keywords"},
-            },
-            "required": ["query"],
-        },
-    },
-]
-
-
-
-
-
 #----------------------Tool calls----------------------------
 
-def _resolve_tool_path(raw_path: str, *, must_exist: bool = True) -> Path:
-    path = Path(raw_path)
-    if path.exists() or not path.is_absolute():
-        return path
-
-    parts = path.parts
-    cwd = Path.cwd()
-    for i in range(1, len(parts)):
-        candidate = cwd.joinpath(*parts[i:])
-        if must_exist and candidate.exists():
-            return candidate
-        if not must_exist and candidate.parent.exists():
-            return candidate
-
-    return path
+def _resolve_tool_path(raw_path: str) -> Path:
+    """Preserve the requested destination, including missing absolute paths."""
+    return Path(raw_path)
 
 
-# Read a file and prefix each line with its line number
-def _read_file(inp:dict) -> str:
+@dataclass(frozen=True)
+class FileVersion:
+    device: int
+    inode: int
+    size: int
+    modified_ns: int
+    changed_ns: int
+
+    @classmethod
+    def from_stat(cls, value: os.stat_result) -> FileVersion:
+        return cls(value.st_dev, value.st_ino, value.st_size, value.st_mtime_ns, value.st_ctime_ns)
+
+
+class _FileResult(ToolResult):
+    """Attach the version of the actual open file without changing tool output."""
+    def __new__(cls, text: str, path: Path, version: FileVersion):
+        result = super().__new__(cls, text)
+        result.path = str(path)
+        result.version = version
+        return result
+
+
+MAX_READ_BYTES = 24 * 1024
+MAX_READ_LINES = 1000
+_UNTRACKED = object()
+
+
+def _file_version(path: Path) -> FileVersion | None:
     try:
-        path = _resolve_tool_path(inp["file_path"])
-        content = path.read_text(errors="replace")
-        lines = content.split("\n")
-        numbered = "\n".join(f"{i + 1:4d} | {line}" for i, line in enumerate(lines))
-        return numbered
+        return FileVersion.from_stat(path.stat())
+    except FileNotFoundError:
+        return None
+
+
+def _read_page(handle, offset: int, limit: int) -> str:
+    """Read a line window with bounded buffers, including a final empty line."""
+    for _ in range(offset - 1):
+        piece = handle.readline(MAX_READ_BYTES + 1)
+        if not piece:
+            return f"No lines found at offset {offset}."
+        while not piece.endswith("\n"):
+            piece = handle.readline(MAX_READ_BYTES + 1)
+            if not piece:
+                return f"No lines found at offset {offset}."
+
+    numbered: list[str] = []
+    remaining = MAX_READ_BYTES
+    for number in range(offset, offset + limit):
+        piece = handle.readline(MAX_READ_BYTES + 1)
+        line = piece[:-1] if piece.endswith("\n") else piece
+        encoded = line.encode("utf-8")
+        prefix = f"{number:4d} | "
+        cost = len(prefix.encode("utf-8")) + len(encoded) + 1
+        if cost > remaining:
+            if numbered:
+                notice = f"Byte limit reached. Continue with read_file(offset={number}, limit={limit})."
+            else:
+                beginning = encoded[:max(0, remaining - len(prefix.encode("utf-8")) - 1)].decode("utf-8", errors="ignore")
+                numbered.append(prefix + beginning)
+                notice = (f"Line {number} exceeds the {MAX_READ_BYTES}-byte limit; only its beginning is shown. "
+                          f"Use run_shell for a narrower character range within this line; "
+                          f"read_file(offset={number + 1}, limit={limit}) continues with the next line.")
+            return ("\n".join(numbered) + f"\n\n[Truncated: {notice} "
+                    "Partial file: prefer edit_file to preserve unseen content.]")
+        numbered.append(prefix + line)
+        remaining -= cost
+        if not piece.endswith("\n"):
+            result = "\n".join(numbered)
+            if offset > 1:
+                result += "\n\n[Partial file: earlier lines were omitted. Prefer edit_file to preserve unseen content.]"
+            return result
+    return ("\n".join(numbered) +
+            f"\n\n[Truncated: Line limit reached. Continue with read_file(offset={offset + limit}, limit={limit}). "
+            "Partial file: prefer edit_file to preserve unseen content.]")
+
+
+def _read_file(inp: ToolInput) -> str:
+    try:
+        path = _resolve_tool_path(inp["file_path"]).resolve()
+        with path.open("r", encoding="utf-8", errors="replace") as handle:
+            before = FileVersion.from_stat(os.fstat(handle.fileno()))
+            result = _read_page(handle, inp.get("offset", 1), inp.get("limit", MAX_READ_LINES))
+            after = FileVersion.from_stat(os.fstat(handle.fileno()))
+        if before != after or _file_version(path) != before:
+            return "Error reading file: file changed during the read. Please read_file again."
+        return _FileResult(result, path, before)
     except Exception as e:
         return f"Error reading file: {e}"
 
-def _write_file(inp:dict) -> str:
+
+def _replace_file(path: Path, content: str, expected_version=_UNTRACKED) -> FileVersion:
+    """Stage content, then verify the observed version immediately before commit."""
+    current = _file_version(path)
+    if expected_version is _UNTRACKED:
+        expected_version = current
+    if current != expected_version:
+        raise ValueError("file was modified externally; please read_file again before writing")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666)
     try:
-        path = _resolve_tool_path(inp["file_path"], must_exist=False)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(inp["content"])
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            if current is not None:
+                mode = stat.S_IMODE(path.stat().st_mode)
+                if hasattr(os, "fchmod"):
+                    os.fchmod(handle.fileno(), mode)
+                else:
+                    os.chmod(temporary, mode)
+            handle.write(content)
+            handle.flush()
+            staged_version = FileVersion.from_stat(os.fstat(handle.fileno()))
+            if os.name == "nt":
+                # Windows does not generally permit renaming an open file.
+                # Its stat ctime is creation time and survives rename/link, so
+                # retain the observed staging version instead of restatting
+                # the destination and accidentally adopting an external edit.
+                handle.close()
+            if _file_version(path) != expected_version:
+                raise ValueError("file was modified externally; please read_file again before writing")
+            if expected_version is None:
+                # Link rather than replace so a file created since the check is
+                # never silently overwritten. The staged file is in the same directory.
+                os.link(temporary, path)
+                temporary.unlink()
+            else:
+                os.replace(temporary, path)
+            return staged_version if handle.closed else FileVersion.from_stat(os.fstat(handle.fileno()))
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _write_file(inp: ToolInput, expected_version=_UNTRACKED) -> str:
+    try:
+        path = _resolve_tool_path(inp["file_path"]).resolve()
+        version = _replace_file(path, inp["content"], expected_version)
         _auto_update_memory_index(str(path))
         lines = inp["content"].split("\n")
         line_count = len(lines)
         preview = "\n".join(f"{i + 1:4d} | {l}" for i, l in enumerate(lines[:30]))
         trunc = f"\n  ... ({line_count} lines total)" if line_count > 30 else ""
-        return f"Successfully wrote to {inp['file_path']} ({line_count} lines)\n\n{preview}{trunc}"
+        return _FileResult(f"Successfully wrote to {inp['file_path']} ({line_count} lines)\n\n{preview}{trunc}", path, version)
     except Exception as e:
         return f"Error writing file: {e}"
 
@@ -331,38 +240,45 @@ def _generate_diff(old_content: str, old_string: str, new_string: str) -> str:
     return "\n".join(parts)
 
 # Edit a file
-def _edit_file(inp: dict) -> str:
+def _edit_file(inp: ToolInput, expected_version=_UNTRACKED) -> str:
     try:
-        path = _resolve_tool_path(inp["file_path"])
+        path = _resolve_tool_path(inp["file_path"]).resolve()
+        if expected_version is _UNTRACKED:
+            expected_version = _file_version(path)
         content = path.read_text(errors="replace")
 
         actual = _find_actual_string(content, inp["old_string"])
         if not actual:
             return f"Error: old_string not found in {inp['file_path']}"
 
-        occurrences = content.count(inp["old_string"])
+        # Normalized matches must be unique in the same representation used to
+        # find them, including mixed straight/curly quote spellings.
+        occurrences = (content.count(actual) if actual == inp["old_string"] else
+                       _normalize_quotes(content).count(_normalize_quotes(inp["old_string"])))
         if occurrences > 1:
             return f"Error: old_string found {occurrences} times in {inp['file_path']}. Must be unique."
 
         new_content = content.replace(actual, inp["new_string"], 1)
-        path.write_text(new_content)
+        version = _replace_file(path, new_content, expected_version)
 
         diff = _generate_diff(content, actual, inp["new_string"])
 
         quote_note = " (matched via quote normalization)" if actual != inp["old_string"] else ""
 
-        return f"Successfully edited {inp['file_path']}{quote_note}\n\n{diff}"
+        return _FileResult(f"Successfully edited {inp['file_path']}{quote_note}\n\n{diff}", path, version)
     except Exception as e:
         return f"Error editing file: {e}"
 
 
-def _list_files(inp: dict) -> str:
+def _list_files(inp: ToolInput, path_allowed: Callable[[Path], bool] | None = None) -> str:
     try:
         base = _resolve_tool_path(inp.get("path") or ".")
+        if path_allowed is not None and not path_allowed(base):
+            return "No files found matching the pattern."
         pattern = inp["pattern"]
         files = []
         for p in base.glob(pattern):
-            if p.is_file():
+            if p.is_file() and (path_allowed is None or path_allowed(p)):
                 rel = str(p.relative_to(base) if base != Path(".") else p)
 
                 if "node_modules" in rel or ".git" in rel.split(os.sep):
@@ -381,74 +297,62 @@ def _list_files(inp: dict) -> str:
         return f"Error listing files: {e}"
 
 
-def _grep_search(inp: dict) -> str:
-    pattern = inp["pattern"]
-    path = str(_resolve_tool_path(inp.get("path") or "."))
-    include = inp.get("include")
-
-    if not IS_WIN:
-        try:
-            args = ["grep", "--line-number", "--color=never", "-r"]
-            if include:
-                args.append(f"--include={include}")
-            args.extend(["--", pattern, path])
-
-            result = subprocess.run(
-                args, capture_output=True, text=True, timeout=10
-            )
-            if result.returncode == 1:
-                return "No matches found."
-            if result.returncode == 0:
-                lines = [l for l in result.stdout.split("\n") if l]
-                output = "\n".join(lines[:100])
-                if len(lines) >100:
-                    output += f"\n... and {len(lines) - 100} more matches"
-                return output
-        except Exception:
-            pass
-
-    return _grep_python(pattern, path, include)
+def _grep_search(inp: ToolInput, path_allowed: Callable[[Path], bool] | None = None) -> str:
+    # One regex implementation avoids platform-dependent grep syntax and lets
+    # us reject denied files before opening them, including glob discoveries.
+    return _grep_python(inp["pattern"], str(_resolve_tool_path(inp.get("path") or ".")),
+                        inp.get("include"), path_allowed)
 
 
-def _grep_python(pattern: str, directory: str, include: str | None) -> str:
-    regex = re.compile(pattern)
-    include_pattern = include
+def _grep_python(pattern: str, directory: str, include: str | None,
+                 path_allowed: Callable[[Path], bool] | None = None) -> str:
+    try:
+        regex = re.compile(pattern)
+    except re.error as exc:
+        return f"Error searching files: invalid regular expression: {exc}"
+
     matches: list[str] = []
 
-    def walk(d: str) -> None:
-        if len(matches) >= 200:
+    def search_file(path: Path) -> None:
+        if include and not fnmatch.fnmatch(path.name, include):
+            return
+        if path_allowed is not None and not path_allowed(path):
             return
         try:
-            entries = os.listdir(d)
-        except Exception:
-            return
-        for name in entries:
-            if name.startswith(".") or name == "node_modules":
-                continue
-            full = os.path.join(d, name)
-            if os.path.isdir(full):
-                walk(full)
-                continue
-            if include_pattern and not fnmatch.fnmatch(name, include_pattern):
-                continue
-            try:
-                text = Path(full).read_text(errors="replace")
-                for i, line in enumerate(text.split("\n")):
+            with path.open("r", encoding="utf-8", errors="replace") as handle:
+                for line_number, line in enumerate(handle, start=1):
+                    line = line.rstrip("\n")
                     if regex.search(line):
-                        matches.append(f"{full}:{i+1}:{line}")
+                        matches.append(f"{path}:{line_number}:{line}")
                         if len(matches) >= 200:
-                            return
-            except Exception:
-                pass
+                            break
+        except OSError:
+            return
 
-    walk(directory)
+    root = Path(directory)
+    if path_allowed is not None and not path_allowed(root):
+        return "No matches found."
+    if root.is_file():
+        search_file(root)
+    else:
+        # Prune excluded directories before visiting them. Directory symlinks
+        # are not followed because they may point back to an ancestor.
+        for parent, directories, files in os.walk(root, followlinks=False):
+            directories[:] = [name for name in directories if not name.startswith(".") and name != "node_modules"
+                              and (path_allowed is None or path_allowed(Path(parent) / name))]
+            for name in files:
+                if not name.startswith(".") and name != "node_modules":
+                    search_file(Path(parent) / name)
+                if len(matches) >= 200:
+                    break
+            if len(matches) >= 200:
+                break
     if not matches:
         return "No matches found."
     output = "\n".join(matches[:100])
     if len(matches) > 100:
         output += f"\n... and {len(matches) - 100} more matches"
     return output
-
 
 
 #--------Truncate overly long tool results
@@ -467,52 +371,76 @@ def _truncate_result(result:str) -> str:
     )
 
 
-
-
-
-
 #----------Deferred tool activation---------------------------
 _activated_tools: set[str] = set()
-
 
 
 def reset_activated_tools() -> None:
     _activated_tools.clear()
 
 def get_active_tool_definitions(all_tools: list[ToolDef] | None = None) -> list[ToolDef]:
+    """Return active API schemas without internal deferred-tool metadata."""
     tools = all_tools if all_tools is not None else tool_definitions
-    return [
-        {k: v for k, v in t.items() if k != "deferred"}
-        for t in tools
-        if not t.get("deferred") or t["name"] in _activated_tools
-    ]
+    active: list[ToolDef] = []
+    for tool in tools:
+        if tool.get("deferred") and tool["name"] not in _activated_tools:
+            continue
+        schema = tool.copy()
+        schema.pop("deferred", None)
+        active.append(schema)
+    return active
 
 def get_deferred_tool_names(all_tools: list[ToolDef] | None = None) -> list[str]:
     tools = all_tools if all_tools is not None else tool_definitions
     return [t["name"] for t in tools if t.get("deferred") and t["name"] not in _activated_tools]
 
 # Run a shell command
-def _run_shell(inp: dict) -> str:
+async def _run_shell(inp: ToolInput) -> str:
+    process = None
+    output_task = None
     try:
         timeout_ms = inp.get("timeout", 30000)
         timeout_s = timeout_ms / 1000
-        result = subprocess.run(
+        if timeout_s <= 0:
+            return "Error: timeout must be positive"
+        process = await asyncio.create_subprocess_shell(
             inp["command"],
-            shell=True,
-            capture_output=True,
-            text=True,
-            timeout=timeout_s,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            start_new_session=os.name != "nt",
         )
-        output = result.stdout or ""
-        if result.returncode != 0:
-            stderr = f"\nStderr: {result.stderr}" if result.stderr else ""
-            stdout = f"\nStdout: {result.stdout}" if result.stdout else ""
-            return f"Command failed (exit code {result.returncode}){stdout}{stderr}"
-        return output or "(no output)"
-    except subprocess.TimeoutExpired:
-        return f"Command timed out after {inp.get('timeout', 30000)}ms"
+        output_task = asyncio.create_task(process.communicate())
+        stdout_bytes, stderr_bytes = await asyncio.wait_for(asyncio.shield(output_task), timeout_s)
+        stdout = stdout_bytes.decode(errors="replace")
+        stderr = stderr_bytes.decode(errors="replace")
+        output = stdout or ""
+        if process.returncode != 0:
+            stderr = f"\nStderr: {stderr}" if stderr else ""
+            stdout = f"\nStdout: {stdout}" if stdout else ""
+            return ToolResult(f"Command failed (exit code {process.returncode}){stdout}{stderr}", failed=True)
+        if stderr:
+            output += ("\n" if output else "") + "Stderr:\n" + stderr
+        return ToolResult(output or "(no output)")
+    except asyncio.TimeoutError:
+        return ToolResult(f"Command timed out after {inp.get('timeout', 30000)}ms", failed=True)
+    except asyncio.CancelledError:
+        raise
     except Exception as e:
         return f"Error: {e}"
+    finally:
+        if process is not None and output_task is not None and not output_task.done():
+            try:
+                if os.name == "nt":
+                    killer = await asyncio.create_subprocess_exec(
+                        "taskkill", "/PID", str(process.pid), "/T", "/F",
+                        stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
+                    await killer.wait()
+                else:
+                    os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            await output_task
+            await process.wait()
 
 
 # Patterns for detecting dangerous commands
@@ -540,7 +468,7 @@ def is_dangerous(command: str) -> bool:
 
 # Permission rules
 def _parse_rule(rule: str) -> dict:
-    m = re.match(r"^([a-z_]+)\((.+)\)$", rule)
+    m = re.match(r"^([A-Za-z0-9_-]+)\((.+)\)$", rule)
     if m:
         return {"tool": m.group(1), "pattern": m.group(2)}
     return {"tool": rule, "pattern": None}
@@ -554,12 +482,21 @@ def _load_settings(file_path: Path) -> dict | None:
         return None
 
 _cached_rules: dict | None = None
-
+_cached_rules_signature = None
 
 
 def load_permission_rules() -> dict:
-    global _cached_rules
-    if _cached_rules is not None:
+    global _cached_rules, _cached_rules_signature
+    from .project_trust import is_project_trusted, trust_file
+    paths = [Path.home() / ".cairn" / "settings.json", Path.cwd() / ".cairn" / "settings.json",
+             Path.cwd() / ".mcp.json", trust_file()]
+    def signature(path):
+        try:
+            return hashlib.sha256(path.read_bytes()).hexdigest()
+        except OSError:
+            return None
+    current_signature = (str(Path.cwd().resolve()), *(signature(path) for path in paths))
+    if _cached_rules is not None and _cached_rules_signature == current_signature:
         return _cached_rules
 
     allow: list[dict] = []
@@ -568,17 +505,81 @@ def load_permission_rules() -> dict:
     user_settings = _load_settings(Path.home() / ".cairn" / "settings.json")
     project_settings = _load_settings(Path.cwd() / ".cairn" / "settings.json")
 
-    for settings in [user_settings, project_settings]:
+    for settings, trusted in [(user_settings, True), (project_settings, is_project_trusted())]:
         if not settings or "permissions" not in settings:
             continue
         perms = settings["permissions"]
-        for r in perms.get("allow", []):
-            allow.append(_parse_rule(r))
+        if trusted:
+            for r in perms.get("allow", []):
+                allow.append(_parse_rule(r))
         for r in perms.get("deny", []):
             deny.append(_parse_rule(r))
 
     _cached_rules = {"allow": allow, "deny": deny}
+    _cached_rules_signature = current_signature
     return _cached_rules
+
+
+def _permission_paths(value: str) -> set[str]:
+    lexical = os.path.normcase(os.path.abspath(value))
+    paths = {lexical}
+    try:
+        # Resolve the original path before collapsing '..': alias/../secret
+        # follows the symlink first, which can differ from abspath(value).
+        path = Path(value)
+        if not path.is_absolute():
+            path = Path.cwd() / path
+        paths.add(os.path.normcase(str(path.resolve())))
+        # Preserve intermediate symlink routes: private/link -> public.txt
+        # must still match private/* when private itself is reached by an alias.
+        for parent in path.parents:
+            resolved = parent.resolve()
+            if resolved != parent:
+                paths.add(os.path.normcase(os.path.abspath(resolved / path.relative_to(parent))))
+    except (OSError, RuntimeError):
+        pass
+    return paths
+
+
+def _permission_patterns(pattern: str) -> tuple[set[str], bool]:
+    prefix = pattern.endswith("*")
+    raw = pattern[:-1] if prefix else pattern
+    trailing_separator = raw.endswith((os.sep, os.altsep or os.sep))
+    paths = _permission_paths(raw)
+    if prefix and trailing_separator:
+        paths = {path if path.endswith(os.sep) else path + os.sep for path in paths}
+    return paths, prefix
+
+
+def _path_matches_pattern(value: str, pattern: str) -> bool:
+    """Compare real paths while retaining the existing trailing-* prefix rules."""
+    if pattern == "*":
+        return True
+    patterns, prefix = _permission_patterns(pattern)
+    return any(candidate.startswith(normalized) if prefix else candidate == normalized
+               for candidate in _permission_paths(value) for normalized in patterns)
+
+
+def _discovery_path_filter(tool_name: str, permission_mode: PermissionMode) -> Callable[[Path], bool]:
+    if permission_mode == "bypassPermissions":
+        return lambda path: True
+    rules = [rule for rule in load_permission_rules()["deny"]
+             if rule["tool"] in {tool_name, "read_file"}]
+    if any(rule["pattern"] in {None, "*"} for rule in rules):
+        return lambda path: False
+    patterns = [_permission_patterns(rule["pattern"]) for rule in rules]
+    if not patterns:
+        return lambda path: True
+
+    def allowed(path: Path) -> bool:
+        # Checking lexical and resolved parents covers a denied directory
+        # discovered from an allowed ancestor and symlinks crossing its boundary.
+        candidates = {str(parent) for value in _permission_paths(str(path))
+                      for parent in (Path(value), *Path(value).parents)}
+        return not any(candidate.startswith(pattern) if prefix else candidate == pattern
+                       for values, prefix in patterns for pattern in values for candidate in candidates)
+
+    return allowed
 
 
 def _matches_rule(rule: dict, tool_name: str, inp: dict) -> bool:
@@ -590,10 +591,18 @@ def _matches_rule(rule: dict, tool_name: str, inp: dict) -> bool:
     value = ""
     if tool_name == "run_shell":
         value = inp.get("command", "")
+    elif tool_name == "mcp_start":
+        value = inp.get("server_name", "")
+    elif tool_name in {"skill_create", "skill_evolve", "skill_restore", "skill_prune"}:
+        value = inp.get("skill_name") or inp.get("name", "")
     elif "file_path" in inp:
-        value = inp["file_path"]
+        return _path_matches_pattern(inp["file_path"], rule["pattern"])
+    elif tool_name in {"grep_search", "list_files"}:
+        return _path_matches_pattern(inp.get("path") or ".", rule["pattern"])
+    elif tool_name.startswith("mcp__") and isinstance(inp.get("command"), str):
+        value = inp["command"]
     else:
-        return True
+        return False
 
     pattern = rule["pattern"]
     if pattern.endswith("*"):
@@ -615,7 +624,7 @@ def _check_permission_rules(tool_name: str, inp: dict) -> str | None:
 def check_permission(
     tool_name: str,
     inp: dict,
-    mode: str = "default",
+    mode: PermissionMode = "default",
     plan_file_path: str | None = None,
 ) -> dict:
     """Returns {"action": "allow"|"deny"|"confirm", "message": ...}"""
@@ -626,14 +635,13 @@ def check_permission(
     if rule_result == "deny":
         return {"action": "deny", "message": f"Denied by permission rule for {tool_name}"}
 
-    # Plan mode restrictions come before allow rules, so a broad allow rule cannot bypass read-only planning.
     if mode == "plan":
-        # MCP tools may have side effects we cannot inspect, so they are blocked while planning.
-        if tool_name.startswith("mcp__"):
+        if tool_name == "mcp_start" or tool_name.startswith("mcp__"):
             return {"action": "deny", "message": "MCP tools are blocked in plan mode"}
         if tool_name in EDIT_TOOLS:
             file_path = inp.get("file_path") or inp.get("path")
-            if plan_file_path and file_path == plan_file_path:
+            if (tool_name in {"write_file", "edit_file"} and plan_file_path
+                    and _path_matches_pattern(file_path, plan_file_path)):
                 return {"action": "allow"}
             return {"action": "deny", "message": f"Blocked in plan mode: {tool_name}"}
         if tool_name == "run_shell":
@@ -648,11 +656,10 @@ def check_permission(
     if tool_name in ("enter_plan_mode", "exit_plan_mode"):
         return {"action": "allow"}
 
-    # External MCP tools need explicit approval unless an allow rule covers them.
     if tool_name.startswith("mcp__"):
         if mode == "dontAsk":
             return {"action": "deny", "message": "Auto-denied (dontAsk mode): MCP tool call"}
-        return {"action": "confirm", "message": f"MCP tool call: {tool_name}"}
+        return {"action": "confirm", "message": f"MCP tool call: {tool_name}\nArguments: {json.dumps(inp, ensure_ascii=False, sort_keys=True)}"}
 
     if mode == "acceptEdits" and tool_name in EDIT_TOOLS:
         return {"action": "allow"}
@@ -660,21 +667,32 @@ def check_permission(
     needs_confirm = False
     confirm_message = ""
 
-    if tool_name == "run_shell" and is_dangerous(inp.get("command", "")):
+    # A shell command can write files through an interpreter, pipe, or subprocess.
+    # A blacklist cannot reliably distinguish read-only commands from writes.
+    if tool_name == "run_shell":
         needs_confirm = True
         confirm_message = inp.get("command", "")
-    elif tool_name == "write_file" and not _resolve_tool_path(inp.get("file_path", ""), must_exist=False).exists():
+    elif tool_name == "mcp_start":
         needs_confirm = True
-        confirm_message = f"write new file: {inp.get('file_path', '')}"
-    elif tool_name == "edit_file" and not _resolve_tool_path(inp.get("file_path", "")).exists():
+        confirm_message = f"start MCP server {inp.get('server_name', '')}: {inp.get('command', '')} (cwd: {inp.get('cwd', '')})"
+    elif tool_name == "write_file":
         needs_confirm = True
-        confirm_message = f"edit non-existent file: {inp.get('file_path', '')}"
+        confirm_message = f"write file: {inp.get('file_path', '')}"
+    elif tool_name == "edit_file":
+        needs_confirm = True
+        confirm_message = f"edit file: {inp.get('file_path', '')}"
     elif tool_name == "skill_evolve":
         needs_confirm = True
         confirm_message = f"evolve skill: {inp.get('skill_name', '')}"
     elif tool_name == "skill_create":
         needs_confirm = True
         confirm_message = f"create skill: {inp.get('name', '')}"
+    elif tool_name in {"skill_prune", "skill_restore"}:
+        needs_confirm = True
+        confirm_message = f"{tool_name}: {inp.get('skill_name', '')}"
+    elif tool_name == "state_cleanup":
+        needs_confirm = True
+        confirm_message = f"delete old disposable artifacts: {json.dumps(inp, ensure_ascii=False)}"
 
     if needs_confirm:
         if mode == "dontAsk":
@@ -684,111 +702,135 @@ def check_permission(
     return {"action": "allow"}
 
 
-
-
-
-
 #----------------Execute tool calls-----------------------
 # The 'agent' and 'skill' tools are handled in agent.py to avoid a circular dependency."
 
+def _tool_search(inp: ToolInput) -> str:
+    query = (inp.get("query") or "").lower()
+    matches = [
+        tool for tool in tool_definitions
+        if tool.get("deferred")
+        and (query in tool["name"].lower() or query in (tool.get("description") or "").lower())
+    ]
+    if not matches:
+        return "No matching deferred tools found."
+
+    _activated_tools.update(tool["name"] for tool in matches)
+    return json.dumps(
+        [{"name": tool["name"], "description": tool.get("description", ""), "input_schema": tool["input_schema"]}
+         for tool in matches],
+        indent=2,
+    )
+
+
+def _skill_evolve(inp: ToolInput) -> str:
+    from .skills import evolve_skill
+
+    result = evolve_skill(
+        skill_name=inp.get("skill_name", ""),
+        lesson=inp.get("lesson", ""),
+        rationale=inp.get("rationale", ""),
+        target=inp.get("target", "active"),
+    )
+    return json.dumps(result, ensure_ascii=False, indent=2)
+
+
+def _skill_create(inp: ToolInput) -> str:
+    from .skills import create_skill
+
+    result = create_skill(
+        name=inp.get("name", ""),
+        description=inp.get("description", ""),
+        instructions=inp.get("instructions", ""),
+        when_to_use=inp.get("when_to_use", "") or inp.get("when-to-use", ""),
+        target=inp.get("target", "project"),
+        context=inp.get("context", "inline"),
+        user_invocable=bool(inp.get("user_invocable", False)),
+        allowed_tools=inp.get("allowed_tools"),
+        evidence=inp.get("evidence", ""),
+    )
+    return json.dumps(result, ensure_ascii=False, indent=2)
+
+
+def _check_file_write_state(name: str, inp: ToolInput, read_file_state: dict[str, FileVersion]) -> str | None:
+    """Require a fresh read before replacing an existing file."""
+    abs_path = str(_resolve_tool_path(inp["file_path"]).resolve())
+    try:
+        version = _file_version(Path(abs_path))
+    except OSError as exc:
+        return f"Error checking file before {name}: {exc}"
+
+    if version is None:
+        return None
+    verb = "writing" if name == "write_file" else "editing"
+    if abs_path not in read_file_state:
+        return f"Error: You must read this file before {verb}. Use read_file first to see its current contents."
+    if version != read_file_state[abs_path]:
+        return ToolResult(f"Warning: {inp['file_path']} was modified externally since your last read. Please read_file again before {verb}.", failed=True)
+    return None
+
+
 async def execute_tool(
-    name: str, inp: dict, read_file_state: dict[str, float] | None = None
+    name: str, inp: ToolInput, read_file_state: dict[str, FileVersion] | None = None, *,
+    truncate_result: bool = True, permission_mode: PermissionMode = "default",
 ) -> str:
-    if name == "read_file":
-        result = _read_file(inp)
-        if read_file_state is not None and not result.startswith("Error"):
-            abs_path = str(_resolve_tool_path(inp["file_path"]).resolve())
-            try:
-                read_file_state[abs_path] =  os.path.getmtime(abs_path)
-            except OSError:
-                pass
-        return _truncate_result(result)
+    from .validation import validate_json
 
-    if name in ("write_file", "edit_file") and read_file_state is not None:
-        abs_path = str(_resolve_tool_path(inp["file_path"], must_exist=(name == "edit_file")).resolve())
-        if os.path.exists(abs_path):
-            if abs_path not in read_file_state:
-                verb = "writing" if name == "write_file" else "editing"
-                return f"Error: You must read this file before {verb}. Use read_file first to see its current contents."
-            if os.path.getmtime(abs_path) != read_file_state[abs_path]:
-                verb = "writing" if name == "write_file" else "editing"
-                return f"Warning: {inp['file_path']} was modified externally since your last read. Please read_file again before {verb}."
+    definition = next((tool for tool in tool_definitions if tool["name"] == name), None)
+    if definition is not None:
+        error = validate_json(inp, definition["input_schema"])
+        if error:
+            return f"Error: invalid arguments for {name}: {error}"
 
-    # Search for and activate deferred tools.
+    if name in {"write_file", "edit_file"} and read_file_state is not None:
+        error = _check_file_write_state(name, inp, read_file_state)
+        if error:
+            return error
+
     if name == "tool_search":
-        query = (inp.get("query") or "").lower()
-        deferred = [t for t in tool_definitions if t.get("deferred")]
-        matches = [
-            t for t in deferred
-            if query in t["name"].lower() or query in (t.get("description") or "").lower()
-        ]
-        if not matches:
-            return "No matching deferred tools found."
+        # Return the complete schema payload even when ordinary output is capped.
+        return _tool_search(inp)
 
-        for m in matches:
-            _activated_tools.add(m["name"])
+    if name == "run_shell":
+        # Shell execution must remain awaitable so cancellation kills descendants.
+        result = await _run_shell(inp)
+    elif name in {"write_file", "edit_file"} and read_file_state is not None:
+        path = str(_resolve_tool_path(inp["file_path"]).resolve())
+        handler = _write_file if name == "write_file" else _edit_file
+        result = handler(inp, expected_version=read_file_state.get(path))
+    elif name in {"list_files", "grep_search"}:
+        path_allowed = _discovery_path_filter(name, permission_mode)
+        handler = _list_files if name == "list_files" else _grep_search
+        result = await asyncio.to_thread(handler, inp, path_allowed)
+    else:
+        handlers: dict[str, SyncToolHandler] = {
+            "read_file": _read_file,
+            "write_file": _write_file,
+            "edit_file": _edit_file,
+            "list_files": _list_files,
+            "grep_search": _grep_search,
+            "skill_evolve": _skill_evolve,
+            "skill_create": _skill_create,
+        }
+        handler = handlers.get(name)
+        if handler is None:
+            return f"Unknown tool: {name}"
+        if name in CONCURRENCY_SAFE_TOOLS:
+            result = await asyncio.to_thread(handler, inp)
+        else:
+            # Do not leave a file mutation running in a worker after cancellation.
+            result = handler(inp)
 
-        return json.dumps(
-            [{"name": t["name"], "description": t.get("description", ""), "input_schema": t["input_schema"]} for t in
-             matches],
-            indent=2,
-        )
-    if name == "skill_evolve":
-        from .skills import evolve_skill
-
-        result = evolve_skill(
-            skill_name=inp.get("skill_name", ""),
-            lesson=inp.get("lesson", ""),
-            rationale=inp.get("rationale", ""),
-            target=inp.get("target", "active"),
-        )
-        return _truncate_result(json.dumps(result, ensure_ascii=False, indent=2))
-
-    if name == "skill_create":
-        from .skills import create_skill
-
-        result = create_skill(
-            name=inp.get("name", ""),
-            description=inp.get("description", ""),
-            instructions=inp.get("instructions", ""),
-            when_to_use=inp.get("when_to_use", "") or inp.get("when-to-use", ""),
-            target=inp.get("target", "project"),
-            context=inp.get("context", "inline"),
-            user_invocable=bool(inp.get("user_invocable", False)),
-            allowed_tools=inp.get("allowed_tools"),
-            evidence=inp.get("evidence", ""),
-        )
-        return _truncate_result(json.dumps(result, ensure_ascii=False, indent=2))
-
-    handlers: dict = {
-        "write_file": _write_file,
-        "edit_file": _edit_file,
-        "list_files": _list_files,
-        "grep_search": _grep_search,
-        "run_shell": _run_shell,
-    }
-    handler = handlers.get(name)
-
-    if not handler:
-        return f"Unknown tool: {name}"
-
-    result = _truncate_result(handler(inp))
-
-    # Update timestamp
-    if name in ("write_file", "edit_file") and read_file_state is not None and not result.startswith("Error"):
-        abs_path = str(_resolve_tool_path(inp["file_path"], must_exist=False).resolve())
-        try:
-            read_file_state[abs_path] = os.path.getmtime(abs_path)
-        except OSError:
-            pass
-
-    return result
-
+    if name in {"read_file", "write_file", "edit_file"} and read_file_state is not None:
+        if isinstance(result, _FileResult):
+            read_file_state[result.path] = result.version
+        elif name == "read_file":
+            read_file_state.pop(str(_resolve_tool_path(inp["file_path"]).resolve()), None)
+    return _truncate_result(result) if truncate_result else result
 
 
 def reset_permission_cache() -> None:
     global _cached_rules
     _cached_rules = None
-
 
 
