@@ -74,7 +74,7 @@ Long sessions are kept within the model's context window by a multi-level pipeli
 | Microcompaction | 5 minutes idle | Clears old tool results that have already been used |
 | Folding | Context over 70% full, or `/compact` | Summarizes history into structured episode, working, and tool memory |
 
-Tool results over 30 KB are saved to `~/.cairn/tool-results/`. Only a preview stays in context.
+`read_file` returns at most 1000 lines and 24 KiB per call and pages through larger files with `offset` and `limit`. File writes are checked against the version that was read (device, inode, size, and timestamps) and committed atomically, so an external edit in between is never silently overwritten. Tool results over 30 KB are saved to `~/.cairn/tool-results/`. Only a preview stays in context.
 
 Folding is configurable per agent:
 
@@ -109,7 +109,7 @@ CAIRN_AUTO_SKILL_TARGET=project   # or "user" to share learned skills across pro
 
 ## Permissions
 
-Every tool call goes through a permission check before it runs. Read-only tools are always allowed. Writing a new file, running a dangerous shell command (such as `rm`, `sudo`, or `git push`), calling an MCP tool, and changing skills all ask for confirmation first.
+Every tool call goes through a permission check before it runs. Read-only tools are always allowed. Every shell command, file write, file edit, MCP tool call, and skill change asks for confirmation, each time. Shell commands are never auto-approved by a blacklist, because a command can write files through an interpreter or a pipe.
 
 Permission modes:
 
@@ -117,11 +117,11 @@ Permission modes:
 |---|---|
 | `default` | Ask before risky actions |
 | `plan` | Read-only. Edits, shell commands, and MCP tools are blocked, except writing the plan file |
-| `acceptEdits` | File edits are allowed without asking |
+| `acceptEdits` | File edits are allowed without asking; shell commands still ask |
 | `dontAsk` | Anything that would need confirmation is denied |
 | `bypassPermissions` | Everything is allowed |
 
-You can also add allow and deny rules in `~/.cairn/settings.json` or `.cairn/settings.json`. Deny rules are checked first, and plan mode restrictions apply even when an allow rule matches. A trailing `*` matches by prefix.
+You can also add allow and deny rules in `~/.cairn/settings.json` or `.cairn/settings.json`. Deny rules are checked first and match every alias of a path (relative, absolute, `..`, or a symlink). Plan mode restrictions apply even when an allow rule matches. A trailing `*` matches by prefix. Allow rules in a project's own settings only take effect after you explicitly trust that project, and editing the file revokes the trust.
 
 ```json
 {
