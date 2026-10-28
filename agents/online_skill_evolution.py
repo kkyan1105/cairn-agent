@@ -7,7 +7,7 @@ from typing import Any, Awaitable, Callable
 
 
 SideQuery = Callable[[str, str], Awaitable[str]]
-ConfirmWrite = Callable[[str], Awaitable[bool]]
+ConfirmWrite = Callable[[str, dict[str, Any]], Awaitable[bool]]
 
 
 @dataclass
@@ -23,19 +23,23 @@ class OnlineSkillCandidate:
 def _parse_json_object(text: str) -> dict[str, Any]:
     raw = str(text or "").strip()
     if not raw:
-        return {}
+        raise ValueError("empty model response")
     try:
-        return json.loads(raw)
-    except Exception:
+        value = json.loads(raw)
+        if isinstance(value, dict):
+            return value
+    except ValueError:
         pass
     start = raw.find("{")
     end = raw.rfind("}")
     if start >= 0 and end > start:
         try:
-            return json.loads(raw[start : end + 1])
-        except Exception:
-            return {}
-    return {}
+            value = json.loads(raw[start : end + 1])
+            if isinstance(value, dict):
+                return value
+        except ValueError:
+            pass
+    raise ValueError("model response must contain a JSON object")
 
 
 def _normalize_identity(text: str) -> str:
@@ -106,12 +110,15 @@ async def extract_online_skill_candidate(
     }
     parsed = _parse_json_object(await side_query(system, json.dumps(payload, ensure_ascii=False)))
     skills = parsed.get("skills")
-    if not isinstance(skills, list) or not skills:
+    if not isinstance(skills, list) or len(skills) > 1:
+        raise ValueError("extractor must return a skills array with at most one candidate")
+    if not skills:
         return None
     first = skills[0]
-    if not isinstance(first, dict):
-        return None
-    return _coerce_candidate(first)
+    candidate = _coerce_candidate(first) if isinstance(first, dict) else None
+    if candidate is None:
+        raise ValueError("invalid extracted Skill candidate")
+    return candidate
 
 
 def _exact_identity_match(candidate: OnlineSkillCandidate, skills: list[Any]) -> str:
@@ -140,6 +147,7 @@ async def maintain_online_skill_candidate(
     retrieved_reference: dict[str, Any] | None = None,
     confirm_write: ConfirmWrite | None = None,
     target: str = "project",
+    stage_only: bool = False,
 ) -> dict[str, Any]:
     from .skills import create_skill, discover_skills, evolve_skill, retrieve_relevant_skills
 
@@ -187,35 +195,23 @@ async def maintain_online_skill_candidate(
     if exact_target:
         action = "merge"
         target_skill = exact_target
-    elif action == "add" and similar_hits:
-        top = similar_hits[0]
-        if float(top.get("score", 0.0)) >= 0.55:
-            action = "merge"
-            target_skill = str(top.get("name") or "")
     elif action == "merge" and not target_skill:
         target_skill = top_reference_name
 
     if action not in {"add", "merge", "discard"}:
-        action = "discard"
+        raise ValueError("invalid Skill maintenance action")
 
     if action == "discard":
         return {"ok": True, "action": "discard", "skill": "", "decision": decision}
-
-    write_summary = f"online skill evolution: {action} {target_skill or candidate.name}"
-    if confirm_write is not None and not await confirm_write(write_summary):
-        return {
-            "ok": False,
-            "action": f"{action}_denied",
-            "skill": target_skill or candidate.name,
-            "error": "permission denied",
-            "decision": decision,
-        }
 
     if action == "merge":
         target_skill = target_skill or top_reference_name
         if not target_skill:
             return {"ok": False, "action": "merge", "error": "missing target_skill", "decision": decision}
-        result = evolve_skill(
+        if not isinstance(decision.get("merged_instructions"), str) or not decision["merged_instructions"].strip():
+            return {"ok": False, "action": "merge", "error": "merge requires complete merged_instructions", "decision": decision}
+        tool_name = "skill_evolve"
+        write_input = dict(
             skill_name=target_skill,
             lesson=candidate.evidence or candidate.description,
             rationale=str(decision.get("reason") or "Online maintainer merge"),
@@ -226,20 +222,32 @@ async def maintain_online_skill_candidate(
             tags=candidate.tags,
             preserve_existing=True,
         )
+    else:
+        tool_name = "skill_create"
+        write_input = dict(
+            name=candidate.name, description=candidate.description, instructions=candidate.instructions,
+            when_to_use=candidate.when_to_use, target=target, context="inline", user_invocable=False,
+            evidence=candidate.evidence, actor="online", tags=candidate.tags,
+        )
+
+    if confirm_write is None or not await confirm_write(tool_name, write_input):
+        return {
+            "ok": False,
+            "action": f"{action}_denied",
+            "skill": target_skill or candidate.name,
+            "error": "permission denied",
+            "decision": decision,
+        }
+
+    if stage_only:
+        from .skill_candidates import stage_candidate
+        return stage_candidate(action, write_input)
+
+    if action == "merge":
+        result = evolve_skill(**write_input)
         return {"action": "merge", "candidate": asdict(candidate), "decision": decision, **result}
 
-    result = create_skill(
-        name=candidate.name,
-        description=candidate.description,
-        instructions=candidate.instructions,
-        when_to_use=candidate.when_to_use,
-        target=target,
-        context="inline",
-        user_invocable=False,
-        evidence=candidate.evidence,
-        actor="online",
-        tags=candidate.tags,
-    )
+    result = create_skill(**write_input)
     return {"action": "add", "candidate": asdict(candidate), "decision": decision, **result}
 
 
@@ -251,6 +259,8 @@ async def online_ingest(
     hint: str = "",
     confirm_write: ConfirmWrite | None = None,
     target: str = "project",
+    replay_context: dict[str, Any] | None = None,
+    stage_only: bool = True,
 ) -> dict[str, Any]:
     from .skills import record_online_provenance
 
@@ -265,6 +275,7 @@ async def online_ingest(
         result = {"ok": False, "action": "failed", "error": str(exc)}
         record_online_provenance(
             action="failed",
+            replay_context=replay_context,
             result=result,
             messages=messages,
             retrieved_reference=retrieved_reference,
@@ -276,6 +287,7 @@ async def online_ingest(
         result = {"ok": True, "action": "none"}
         record_online_provenance(
             action="none",
+            replay_context=replay_context,
             result=result,
             messages=messages,
             retrieved_reference=retrieved_reference,
@@ -289,12 +301,14 @@ async def online_ingest(
             retrieved_reference=retrieved_reference,
             confirm_write=confirm_write,
             target=target,
+            stage_only=stage_only,
         )
     except Exception as exc:
         result = {"ok": False, "action": "failed", "skill": candidate.name, "error": str(exc)}
 
     record_online_provenance(
         action=str(result.get("action") or "none"),
+        replay_context=replay_context,
         skill_name=str(result.get("skill") or candidate.name),
         result=result,
         messages=messages,
@@ -315,20 +329,8 @@ async def judge_retrieved_skill_usage(
     if not hits:
         return []
     if side_query is None:
-        assistant_lower = assistant_text.lower()
-        return [
-            {
-                "name": hit.get("name", ""),
-                "source": hit.get("source", ""),
-                "skill_dir": hit.get("skill_dir", ""),
-                "retrieved": True,
-                "relevant": False,
-                "used": str(hit.get("name", "")).lower() in assistant_lower,
-                "score": float(hit.get("score", 0.0)),
-                "reason": "heuristic fallback",
-            }
-            for hit in hits
-        ]
+        # No judge means no evidence. Mentioning a Skill name does not prove usage.
+        return []
 
     system = (
         "Judge whether retrieved skills were relevant to the user request and actually used in the assistant reply.\n"
@@ -337,8 +339,15 @@ async def judge_retrieved_skill_usage(
     )
     payload = {"user_message": user_message, "assistant_reply": assistant_text, "retrieved_skills": hits}
     parsed = _parse_json_object(await side_query(system, json.dumps(payload, ensure_ascii=False)))
-    raw_judgments = parsed.get("judgments") if isinstance(parsed.get("judgments"), list) else []
-    by_name = {str(item.get("name") or ""): item for item in raw_judgments if isinstance(item, dict)}
+    raw_judgments = parsed.get("judgments") if isinstance(parsed, dict) else None
+    names = {str(hit.get("name") or "") for hit in hits}
+    if (not isinstance(raw_judgments, list) or len(raw_judgments) != len(names)
+            or any(not isinstance(item, dict) or item.get("name") not in names
+                   or type(item.get("relevant")) is not bool or type(item.get("used")) is not bool
+                   or (item["used"] and not item["relevant"]) for item in raw_judgments)
+            or len({item["name"] for item in raw_judgments}) != len(names)):
+        raise ValueError("Invalid Skill usage judgments; statistics were not updated")
+    by_name = {item["name"]: item for item in raw_judgments}
     judgments: list[dict[str, Any]] = []
     for hit in hits:
         name = str(hit.get("name") or "")
