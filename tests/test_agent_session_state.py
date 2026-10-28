@@ -1,3 +1,6 @@
+import pytest
+
+
 def tool_use(tool_id):
     return {"role": "assistant", "content": [{"type": "tool_use", "id": tool_id, "name": "read_file", "input": {}}]}
 
@@ -25,15 +28,19 @@ def test_normalization_fixes_tool_use_saved_with_user_role(make_agent):
     assert [m["role"] for m in normalized] == ["assistant", "user"]
 
 
-def test_restore_session_loads_and_cleans_history(make_agent):
+def test_restore_session_loads_and_cleans_history(make_agent, isolated_env):
     agent = make_agent()
     agent.restore_session({
+        "metadata": {"id": "s1", "cwd": str(isolated_env), "apiProtocol": "anthropic"},
         "anthropicMessages": [{"role": "user", "content": "bad \ud800 text"}, tool_use("orphan")],
         "foldedSessionMemories": [{"trigger": "manual"}],
     })
-    assert len(agent._anthropic_messages) == 1
     assert "\ud800" not in agent._anthropic_messages[0]["content"]
     assert agent._folded_session_memories == [{"trigger": "manual"}]
+    # An interrupted tool call is answered with an explicit "unknown status" result, never replayed.
+    user, call, result = agent._anthropic_messages
+    (block,) = result["content"]
+    assert block["tool_use_id"] == "orphan" and "status unknown" in block["content"]
 
 
 def test_cost_budget(make_agent):
@@ -75,3 +82,11 @@ def test_side_query_records_token_usage(make_agent, monkeypatch):
     side_query = agent._build_side_query()
     assert asyncio.run(side_query("system", "user")) == "picked"
     assert (agent.side_input_tokens, agent.side_output_tokens) == (120, 30)
+
+
+def test_restore_session_rejects_other_projects_and_protocols(make_agent, isolated_env, tmp_path):
+    agent = make_agent()
+    with pytest.raises(ValueError, match="another project"):
+        agent.restore_session({"metadata": {"cwd": str(tmp_path)}})
+    with pytest.raises(ValueError, match="protocol"):
+        agent.restore_session({"metadata": {"cwd": str(isolated_env), "apiProtocol": "openai"}})

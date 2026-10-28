@@ -31,14 +31,50 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import shlex
 import subprocess
+import signal
 from pathlib import Path
-from typing import Any
+from typing import Any, Awaitable, Callable
 
 from .ui import print_error, print_info
 
+MCP_TOOL_TIMEOUT_SECONDS = 60.0
+MCP_MAX_MESSAGE_BYTES = 8 * 1024 * 1024
+
+
+class McpToolError(RuntimeError):
+    """A valid MCP response explicitly reported a failed tool operation."""
+
+    def __init__(self, result: dict):
+        self.result = result
+        content = result.get("content") or []
+        text = "\n".join(str(item.get("text", "")) for item in content
+                         if isinstance(item, dict) and item.get("type") == "text")
+        super().__init__("MCP tool failed: " + (text or json.dumps(result, ensure_ascii=False)))
+
 
 # ─── Single MCP connection: one McpConnection per MCP Server subprocess ──────────────────
+
+
+class BorrowedMcpManager:
+    """A child may call its inherited tools, but never owns parent processes."""
+
+    def __init__(self, owner: McpManager, allowed_tools: set[str]):
+        self._owner = owner
+        self._allowed_tools = frozenset(allowed_tools)
+
+    def is_mcp_tool(self, name: str) -> bool:
+        return name in self._allowed_tools
+
+    async def call_tool(self, name: str, args: dict) -> str:
+        if name not in self._allowed_tools:
+            raise ValueError(f"MCP tool not available in this child: {name}")
+        return await self._owner.call_tool(name, args)
+
+    async def disconnect_all(self) -> None:
+        # The parent's lifetime encloses all child calls and owns cleanup.
+        pass
 
 
 class McpConnection:
@@ -64,11 +100,13 @@ class McpConnection:
         self._reader_task: asyncio.Task | None = None
         # Background task draining stderr so a chatty server cannot fill the pipe and block.
         self._stderr_task: asyncio.Task | None = None
+        self._reader_error: Exception | None = None
 
     async def connect(self) -> None:
         """Start the MCP Server subprocess and begin reading its stdout in the background."""
         # Subprocess environment = current process environment + extra variables declared in the config.
         merged_env = {**os.environ, **self.env}
+        self._reader_error = None
         # Start the MCP Server in stdio mode:
         # - stdin: the client writes JSON-RPC requests to the Server.
         # - stdout: the Server returns JSON-RPC responses to the client.
@@ -79,6 +117,8 @@ class McpConnection:
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             env=merged_env,
+            start_new_session=os.name != "nt",
+            limit=MCP_MAX_MESSAGE_BYTES,
         )
         # Keep reading stdout in the background. This must not block connect(), or initialization couldn't continue.
         self._reader_task = asyncio.create_task(self._read_loop())
@@ -94,6 +134,8 @@ class McpConnection:
                 if not line:
                     # Reading nothing means the subprocess's stdout is closed, which usually means the process exited.
                     break
+                if len(line) > MCP_MAX_MESSAGE_BYTES:
+                    raise ValueError(f"MCP message exceeds {MCP_MAX_MESSAGE_BYTES} bytes")
                 try:
                     msg = json.loads(line)
                 except json.JSONDecodeError:
@@ -101,44 +143,53 @@ class McpConnection:
                     continue
 
                 # JSON-RPC responses carry an id; notifications usually don't.
+                if not isinstance(msg, dict):
+                    continue
                 msg_id = msg.get("id")
                 if msg_id is not None and msg_id in self._pending:
                     fut = self._pending.pop(msg_id)
-                    if fut.done():
-                        # The caller already gave up (for example, it timed out or was cancelled).
-                        continue
                     if "error" in msg:
                         # When the Server returns a JSON-RPC error, mark the waiting Future as failed.
                         e = msg["error"]
-                        fut.set_exception(
-                            RuntimeError(f"MCP error {e.get('code')}: {e.get('message')}")
-                        )
-                    else:
+                        if not fut.done():
+                            fut.set_exception(
+                                RuntimeError(f"MCP error {e.get('code')}: {e.get('message')}")
+                            )
+                    elif not fut.done():
                         # For a normal response, only the result part is handed to the caller.
                         fut.set_result(msg.get("result"))
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            self._fail_pending(RuntimeError(f"MCP reader failed: {exc}"))
+            self._reader_error = RuntimeError(f"MCP reader failed (message limit {MCP_MAX_MESSAGE_BYTES} bytes): {exc}")
+            self._fail_pending(self._reader_error)
         else:
-            # The server exited; no response can arrive for requests still in flight.
-            self._fail_pending(RuntimeError(f"MCP server '{self.server_name}' closed"))
+            self._reader_error = RuntimeError(f"MCP server '{self.server_name}' closed")
+            self._fail_pending(self._reader_error)
 
     async def _drain_stderr(self) -> None:
         """Discard the server's stderr. If nobody reads it, the OS pipe buffer fills up and the server blocks on write."""
         assert self._process and self._process.stderr
         try:
             while True:
-                line = await self._process.stderr.readline()
-                if not line:
+                chunk = await self._process.stderr.read(65536)
+                if not chunk:
                     break
         except asyncio.CancelledError:
             raise
         except Exception:
             pass
 
+    def _fail_pending(self, error: Exception) -> None:
+        for fut in list(self._pending.values()):
+            if not fut.done():
+                fut.set_exception(error)
+        self._pending.clear()
+
     async def _send_request(self, method: str, params: dict | None = None) -> Any:
         """Send a JSON-RPC request and wait for the response with the matching id."""
+        if self._reader_error is not None:
+            raise RuntimeError(str(self._reader_error))
         assert self._process and self._process.stdin
         # Allocate a unique id for this request. The read loop uses it to find the matching Future.
         req_id = self._next_id
@@ -152,18 +203,20 @@ class McpConnection:
         #   "params": {...}
         # }
         msg = json.dumps({"jsonrpc": "2.0", "id": req_id, "method": method, "params": params or {}})
-
-        # Register the Future before writing, so a fast response can never arrive before we are listening.
-        # _read_loop wakes it when a response with the same id arrives.
-        fut: asyncio.Future = asyncio.get_running_loop().create_future()
+        loop = asyncio.get_running_loop()
+        fut: asyncio.Future = loop.create_future()
         self._pending[req_id] = fut
+        # The stdio transport uses newlines as message boundaries.
         try:
-            # The stdio transport uses newlines as message boundaries.
             self._process.stdin.write((msg + "\n").encode())
             await self._process.stdin.drain()
             return await fut
-        except BaseException:
-            # On timeout, cancellation, or a broken pipe, drop the request so _pending doesn't leak.
+        except asyncio.CancelledError:
+            self._pending.pop(req_id, None)
+            if not fut.done():
+                fut.cancel()
+            raise
+        except Exception:
             self._pending.pop(req_id, None)
             if not fut.done():
                 fut.cancel()
@@ -206,11 +259,16 @@ class McpConnection:
     async def call_tool(self, name: str, args: dict) -> str:
         """Call a tool on this MCP Server and return the result as a string."""
         result = await self._send_request("tools/call", {"name": name, "arguments": args})
+        if isinstance(result, dict) and result.get("isError") is True:
+            raise McpToolError(result)
         if isinstance(result, dict) and isinstance(result.get("content"), list):
             # MCP tool results are usually a list of content blocks. The Agent currently only consumes text blocks.
-            return "\n".join(
+            text = "\n".join(
                 c["text"] for c in result["content"] if c.get("type") == "text"
             )
+            if result.get("structuredContent") is not None:
+                text += "\n" + json.dumps(result["structuredContent"], ensure_ascii=False)
+            return text or json.dumps(result, ensure_ascii=False)
         # If it isn't a standard content list, fall back to a JSON string to avoid losing information.
         return json.dumps(result)
 
@@ -225,10 +283,14 @@ class McpConnection:
             self._stderr_task = None
         if self._process:
             try:
-                # Close stdin first so a well-behaved server sees EOF, then kill it so it doesn't linger.
-                if self._process.stdin:
+                # Kill the subprocess outright so the external MCP Server doesn't linger.
+                if getattr(self._process, "stdin", None):
                     self._process.stdin.close()
-                self._process.kill()
+                if hasattr(self._process, "kill"):
+                    if os.name != "nt":
+                        os.killpg(self._process.pid, signal.SIGKILL)
+                    else:
+                        self._process.kill()
             except ProcessLookupError:
                 # kill may raise this if the process has already exited; safe to ignore.
                 pass
@@ -236,12 +298,13 @@ class McpConnection:
         # Once the connection is closed, pending requests can never complete, so explicitly fail them.
         self._fail_pending(RuntimeError(f"MCP server '{self.server_name}' closed"))
 
-    def _fail_pending(self, error: Exception) -> None:
-        """Fail every request still waiting for a response."""
-        for fut in list(self._pending.values()):
-            if not fut.done():
-                fut.set_exception(error)
-        self._pending.clear()
+    async def aclose(self) -> None:
+        process = self._process
+        tasks = [task for task in (self._reader_task, self._stderr_task) if task]
+        self.close()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        if process:
+            await asyncio.wait_for(process.wait(), timeout=5)
 
 
 # ─── MCP manager: manages all MCP Server connections and tool routing ─────────────────────────────
@@ -252,7 +315,7 @@ class McpManager:
     Manages all MCP Server connections.
 
     Usage:
-    1. Call load_and_connect() to read config, connect to Servers, and discover tools.
+    1. Call load_and_connect(authorize_start=...) to authorize startup, connect to Servers, and discover tools.
     2. Call get_tool_definitions() to expose MCP tools to the model.
     3. When the model calls a tool named mcp__server__tool, call_tool() routes it to the right Server.
     """
@@ -265,8 +328,10 @@ class McpManager:
         # Guards against reconnecting. load_and_connect() should only really run once.
         self._connected = False
 
-    async def load_and_connect(self) -> None:
-        """Read config, connect to all configured MCP Servers, and discover the tools they provide."""
+    async def load_and_connect(
+        self, *, authorize_start: Callable[[str, dict], Awaitable[bool]] | None = None
+    ) -> None:
+        """Authorize each configured process before connecting and discovering tools."""
         if self._connected:
             return
         self._connected = True
@@ -280,14 +345,18 @@ class McpManager:
         timeout = 15.0
 
         for name, cfg in configs.items():
-            # Create a separate connection object from the config.
-            conn = McpConnection(
-                name,
-                cfg["command"],
-                cfg.get("args"),
-                cfg.get("env"),
-            )
+            conn = None
             try:
+                # Configuration discovery must never implicitly execute project commands.
+                startup = {
+                    "server_name": name,
+                    "command": shlex.join([cfg["command"], *(cfg.get("args") or [])]),
+                    "cwd": str(Path.cwd()),
+                }
+                if authorize_start is None or not await authorize_start("mcp_start", startup):
+                    print_info(f"MCP startup denied: {name}")
+                    continue
+                conn = McpConnection(name, cfg["command"], cfg.get("args"), cfg.get("env"))
                 # Connect subprocess -> MCP initialization handshake -> list tools.
                 await conn.connect()
                 await asyncio.wait_for(conn.initialize(), timeout=timeout)
@@ -296,10 +365,15 @@ class McpManager:
                 self._connections[name] = conn
                 self._tools.extend(server_tools)
                 print_info(f"MCP connected: {name} ({len(server_tools)} tools)")
+            except asyncio.CancelledError:
+                if conn is not None:
+                    await conn.aclose()
+                raise
             except Exception as e:
                 # A single Server failing doesn't affect the others. Failed connections are closed to clean up the subprocess.
                 print_error(f"MCP failed to connect: {name}: {e}")
-                conn.close()
+                if conn is not None:
+                    await conn.aclose()
 
     def get_tool_definitions(self) -> list[dict]:
         """Return tool definitions usable directly by the Agent/Anthropic, with MCP tool names prefixed."""
@@ -331,12 +405,18 @@ class McpManager:
         conn = self._connections.get(server_name)
         if not conn:
             raise RuntimeError(f"MCP server '{server_name}' not connected")
-        return await conn.call_tool(tool_name, args)
+        try:
+            return await asyncio.wait_for(
+                conn.call_tool(tool_name, args), timeout=MCP_TOOL_TIMEOUT_SECONDS
+            )
+        except asyncio.TimeoutError as exc:
+            raise TimeoutError(
+                f"MCP tool '{prefixed_name}' timed out after {MCP_TOOL_TIMEOUT_SECONDS:g} seconds"
+            ) from exc
 
     async def disconnect_all(self) -> None:
         """Disconnect all MCP Servers and clear the tool cache."""
-        for conn in self._connections.values():
-            conn.close()
+        await asyncio.gather(*(conn.aclose() for conn in self._connections.values()))
         self._connections.clear()
         self._tools.clear()
         self._connected = False

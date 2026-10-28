@@ -110,15 +110,13 @@ def test_three_parallel_mode_builds_memory_from_three_calls(make_agent, monkeypa
 
 
 @pytest.mark.parametrize("broken", [RuntimeError("api down"), '{"immediate_goal": "missing fields"}'])
-def test_three_parallel_mode_falls_back_when_any_call_fails(make_agent, monkeypatch, broken):
+def test_failed_parallel_fold_keeps_the_original_conversation(make_agent, monkeypatch, broken):
     agent = make_agent(fold_memory_mode="three_parallel")
     replies = dict(COMPONENT_REPLIES, working_memory=broken)
     monkeypatch.setattr(agent, "_build_side_query", lambda **_: fake_side_query(replies))
 
-    memory = run(agent._generate_folded_session_memory("the original transcript"))
-
-    assert "without structured JSON" in memory["episode_memory"]["task_description"]
-    assert "the original transcript" in memory["episode_memory"]["current_progress"]
+    # A partial or malformed fold is rejected outright, so no history is replaced by bad memory.
+    assert run(agent._generate_folded_session_memory("the original transcript")) is None
 
 
 def test_fold_observer_receives_events_and_errors_are_contained(make_agent):

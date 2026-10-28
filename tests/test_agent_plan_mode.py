@@ -27,13 +27,14 @@ def test_plan_mode_tools_update_openai_system_message(make_agent):
     assert run(agent._execute_plan_mode_tool("enter_plan_mode")) == "Already in plan mode."
 
 
-def test_exit_without_approval_restores_previous_mode(make_agent):
+def test_exit_without_an_approver_stays_in_plan_mode(make_agent):
     agent = make_agent()
-    run(agent._execute_plan_mode_tool("enter_plan_mode"))
-    result = run(agent._execute_plan_mode_tool("exit_plan_mode"))
-    assert agent.permission_mode == "default"
-    assert "Exited plan mode" in result
     assert run(agent._execute_plan_mode_tool("exit_plan_mode")) == "Not in plan mode."
+    run(agent._execute_plan_mode_tool("enter_plan_mode"))
+    run(agent._execute_plan_mode_tool("exit_plan_mode"))
+    # Nobody approved the plan, so nothing is authorized to run.
+    assert agent.permission_mode == "plan"
+    assert agent._aborted is True
 
 
 def enter_plan_with_file(agent, text="1. Do the thing"):

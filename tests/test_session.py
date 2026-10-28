@@ -19,26 +19,35 @@ def test_save_load_and_latest(isolated_env, tmp_path, monkeypatch):
     assert session.load_session("../escape") is None
 
 
+FULL_MEMORY = {
+    "episode_memory": {"task_description": "fix bug", "key_events": [], "current_progress": ""},
+    "working_memory": {"immediate_goal": "", "current_challenges": "", "next_actions": []},
+    "tool_memory": {"tools_used": [], "derived_rules": []},
+}
+
+
 def test_parse_folded_memory_extracts_json_from_noise():
-    text = 'Here is the memory:\n```json\n{"episode_memory": {"task_description": "fix bug"}}\n```'
-    memory = session_memory.parse_folded_memory(text)
-    assert memory["episode_memory"]["task_description"] == "fix bug"
-    assert memory["working_memory"]["next_actions"] == []
-    assert memory["tool_memory"] == {"tools_used": [], "derived_rules": []}
+    text = "Here is the memory:\n```json\n" + json.dumps(FULL_MEMORY) + "\n```"
+    assert session_memory.parse_folded_memory(text)["episode_memory"]["task_description"] == "fix bug"
 
 
-def test_parse_folded_memory_normalizes_wrong_types():
-    text = json.dumps({"episode_memory": {"key_events": "not a list"}, "tool_memory": []})
-    memory = session_memory.parse_folded_memory(text)
-    assert memory["episode_memory"]["key_events"] == []
-    assert memory["tool_memory"]["tools_used"] == []
+@pytest.mark.parametrize(
+    "memory",
+    [
+        {"episode_memory": FULL_MEMORY["episode_memory"]},
+        dict(FULL_MEMORY, episode_memory=dict(FULL_MEMORY["episode_memory"], key_events="not a list")),
+        dict(FULL_MEMORY, episode_memory=dict(FULL_MEMORY["episode_memory"], task_description="")),
+    ],
+)
+def test_parse_folded_memory_rejects_incomplete_or_empty_state(memory):
+    with pytest.raises(ValueError):
+        session_memory.parse_folded_memory(json.dumps(memory))
 
 
-def test_fallback_and_format_produce_reinjectable_text():
-    memory = session_memory.fallback_folded_memory("user asked to refactor main.py")
-    text = session_memory.format_folded_memory(memory)
+def test_format_produces_reinjectable_text():
+    text = session_memory.format_folded_memory(FULL_MEMORY)
     assert text.startswith("<session-folded-memory>")
-    assert "refactor main.py" in text
+    assert "fix bug" in text
 
 
 def test_parse_fold_component_accepts_bare_or_wrapped_objects():

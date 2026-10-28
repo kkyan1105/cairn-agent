@@ -81,12 +81,23 @@ Guidelines:
 
 # In-process cache of discovered custom agents; reused after reading .cairn/agents/*.md so the directory isn't scanned on every agent tool call.
 _cached_custom_agents: dict[str, dict] | None = None
+_cached_agent_signature = None
 
 
 def _discover_custom_agents() -> dict[str, dict]:
     """Discover user-level and project-level custom agents and return their configs keyed by agent name."""
-    global _cached_custom_agents
-    if _cached_custom_agents is not None:
+    global _cached_custom_agents, _cached_agent_signature
+    roots = [Path.home() / ".cairn" / "agents", Path.cwd() / ".cairn" / "agents"]
+    signature = []
+    for root in roots:
+        for path in sorted(root.glob("*.md")):
+            try:
+                info = path.stat()
+                signature.append((str(path.resolve()), info.st_mtime_ns, info.st_size, info.st_ino))
+            except OSError:
+                continue
+    signature = (str(Path.cwd().resolve()), tuple(signature))
+    if _cached_custom_agents is not None and signature == _cached_agent_signature:
         return _cached_custom_agents
 
     agents: dict[str, dict] = {}
@@ -96,6 +107,7 @@ def _discover_custom_agents() -> dict[str, dict]:
     _load_agents_from_dir(Path.cwd() / ".cairn" / "agents", agents)
 
     _cached_custom_agents = agents
+    _cached_agent_signature = signature
     return agents
 
 
@@ -132,9 +144,9 @@ def get_sub_agent_config(agent_type: str) -> dict:
     """Build the system_prompt and tools config the Agent needs at runtime for the given agent type."""
     custom = _discover_custom_agents().get(agent_type)
     if custom:
-        if custom["allowed_tools"]:
+        if custom["allowed_tools"] is not None:
             # When a custom agent declares an explicit tool allowlist, grant only the tools in it.
-            tools = [t for t in tool_definitions if t["name"] in custom["allowed_tools"]]
+            tools = [t for t in tool_definitions if t["name"] in custom["allowed_tools"] and t["name"] != "agent"]
         else:
             # Sub-agents may not call the agent tool, to avoid recursive sub-agent creation complicating control flow.
             tools = [t for t in tool_definitions if t["name"] != "agent"]

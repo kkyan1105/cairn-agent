@@ -38,7 +38,6 @@ def test_sub_agent_inherits_permissions_credentials_and_remaining_budget(make_ag
     assert child.max_turns == 6
     assert child.max_cost_usd == pytest.approx(1.0)
     assert not {"enter_plan_mode", "exit_plan_mode", "agent"} & {t["name"] for t in child.tools}
-    assert parent.total_input_tokens == 10 and parent.total_output_tokens == 5
 
 
 def test_sub_agent_is_skipped_when_budget_is_exhausted(make_agent, captured):

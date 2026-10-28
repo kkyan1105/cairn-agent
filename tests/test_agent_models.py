@@ -3,7 +3,8 @@ from agents import agent
 
 def test_known_and_unknown_context_windows():
     assert agent._get_context_windows("gpt-4o") == 128000
-    assert agent._get_context_windows("some-new-model") == 200000
+    # Unknown models get a conservative window instead of assuming a large one.
+    assert agent._get_context_windows("some-new-model") == 32000
 
 
 def test_max_output_tokens_by_model_family():

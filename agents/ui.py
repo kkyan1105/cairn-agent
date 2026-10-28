@@ -168,9 +168,9 @@ def print_divider() -> None:
     console.rule("[dim]turn complete[/dim]", style="dim")
 
 
-def print_cost(input_tokens: int, output_tokens: int) -> None:
-    cost_in = (input_tokens / 1_000_000) * 3
-    cost_out = (output_tokens / 1_000_000) * 15
+def print_cost(input_tokens: int, output_tokens: int, input_price: float = 3, output_price: float = 15) -> None:
+    cost_in = (input_tokens / 1_000_000) * input_price
+    cost_out = (output_tokens / 1_000_000) * output_price
     total = cost_in + cost_out
     table = Table.grid(padding=(0, 2))
     table.add_column(style="cyan")

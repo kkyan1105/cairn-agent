@@ -10,6 +10,10 @@ from agents.mcp_client import McpConnection, McpManager
 FAKE_SERVER = str(Path(__file__).parent / "fake_mcp_server.py")
 
 
+async def allow_start(_tool_name, _startup):
+    return True
+
+
 def write_mcp_json(project: Path, servers: dict) -> None:
     (project / ".mcp.json").write_text(json.dumps({"mcpServers": servers}))
 
@@ -37,7 +41,7 @@ def test_manager_exposes_prefixed_tools_and_routes_calls(isolated_env):
 
     async def scenario():
         manager = McpManager()
-        await manager.load_and_connect()
+        await manager.load_and_connect(authorize_start=allow_start)
         try:
             names = [t["name"] for t in manager.get_tool_definitions()]
             assert names[:2] == ["mcp__fake__echo", "mcp__fake__fail"]
@@ -58,7 +62,7 @@ def test_manager_skips_servers_that_fail_to_start(isolated_env):
 
     async def scenario():
         manager = McpManager()
-        await manager.load_and_connect()
+        await manager.load_and_connect(authorize_start=allow_start)
         try:
             names = [t["name"] for t in manager.get_tool_definitions()]
             assert all(name.startswith("mcp__fake__") for name in names)
@@ -134,3 +138,21 @@ def test_close_fails_pending_calls_and_is_idempotent():
         conn.close()
 
     asyncio.run(scenario())
+
+
+def test_servers_do_not_start_without_authorization(isolated_env):
+    write_mcp_json(isolated_env, {"fake": {"command": sys.executable, "args": [FAKE_SERVER]}})
+    seen = []
+
+    async def deny(tool_name, startup):
+        seen.append((tool_name, startup["server_name"]))
+        return False
+
+    async def scenario():
+        manager = McpManager()
+        await manager.load_and_connect(authorize_start=deny)
+        assert manager.get_tool_definitions() == []
+        await McpManager().load_and_connect()  # no authorizer: nothing starts either
+
+    asyncio.run(scenario())
+    assert seen == [("mcp_start", "fake")]
