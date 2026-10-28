@@ -53,7 +53,7 @@ docker build -t cairn .
 docker run -it --rm --env-file .env -v "$PWD":/workspace cairn
 ```
 
-Run `cairn --help` for all flags and REPL commands such as `/plan`, `/compact`, `/skills`, and `/skill-eval`. You can also run it without installing it: `python -m agents.main`.
+Run `cairn --help` for all flags and REPL commands such as `/plan`, `/compact`, `/skills`, `/skill-eval`, `/skill-candidates`, `/trust-project`, and `/cleanup-state`. You can also run it without installing it: `python -m agents.main`.
 
 ## How the agent loop works
 
@@ -62,6 +62,8 @@ Run `cairn --help` for all flags and REPL commands such as `/plan`, `/compact`, 
 3. Once the full response has arrived, check permissions for each tool call, then execute it. With OpenAI-compatible backends, consecutive read-only tools run concurrently.
 4. Feed the tool results back to the model and repeat until it answers without calling a tool.
 5. Save the session automatically. Transient API errors are retried with exponential backoff.
+
+Every tool call is wrapped in a durable checkpoint. If a run is interrupted, a call whose outcome is unknown is reported to the model as "status unknown, inspect before retrying" and is never replayed automatically. Text from a failed or retried stream attempt never reaches the final answer.
 
 ### Context management
 
@@ -93,12 +95,13 @@ Sub-agents run with isolated context but inherit the parent's permission mode, c
 
 Skills are `SKILL.md` playbooks stored in `.cairn/skills/` (project) or `~/.cairn/skills/` (user). For each request, Cairn ranks the available skills against the request with BM25 over each skill's name, description, and when-to-use. The most relevant skills are offered to the model.
 
-After each reply, an online evolution loop runs in the background:
+After each reply, an online learning loop runs in the background. It never edits an active skill directly:
 
 1. **Extract.** A side model reads the latest exchange and the user's follow-up feedback, and proposes at most one reusable skill candidate. User turns are the evidence. One-off details, secrets, and assistant-only claims are rejected.
-2. **Maintain.** A skill-set manager decides whether to **add** a new skill, **merge** the candidate into an existing one (keeping the existing guidance), or **discard** it. Background writes happen only in `acceptEdits` or `bypassPermissions` mode, and every merge saves a version snapshot first.
-3. **Track.** For each retrieved skill, a judge records whether it was relevant and actually used. These statistics drive pruning of skills that keep being retrieved but are never used.
-4. **Evaluate.** `/skill-eval` replays recorded conversations against each skill lineage, scores responses with rules compiled from the skill text, and promotes a new version to champion only if it beats the current champion without adding hard failures.
+2. **Stage.** A skill-set manager decides whether to **add** a new skill, **merge** into an existing one, or **discard** the candidate. Accepted proposals are staged in `.cairn/skill-evolution/candidates/` with the final body, the write parameters, and a hash of the skill they were based on.
+3. **Evaluate.** `/skill-eval` replays reviewed past tasks with the current skill and with candidate variants side by side, under a bounded call budget. A candidate becomes the champion only if it beats the baseline by a margin.
+4. **Publish.** `/skill-apply <id>` publishes a candidate whose exact snapshot passed evaluation, or one you approve with `--manual-review`. Publishing is refused if the candidate or the active skill changed in the meantime. `/skill-rollback <skill>` restores the previous version.
+5. **Track.** For each retrieved skill, a judge records whether it was relevant and actually used. Skills that keep being retrieved but are never used can be pruned.
 
 Control it with environment variables:
 
@@ -121,7 +124,7 @@ Permission modes:
 | `dontAsk` | Anything that would need confirmation is denied |
 | `bypassPermissions` | Everything is allowed |
 
-You can also add allow and deny rules in `~/.cairn/settings.json` or `.cairn/settings.json`. Deny rules are checked first and match every alias of a path (relative, absolute, `..`, or a symlink). Plan mode restrictions apply even when an allow rule matches. A trailing `*` matches by prefix. Allow rules in a project's own settings only take effect after you explicitly trust that project, and editing the file revokes the trust.
+You can also add allow and deny rules in `~/.cairn/settings.json` or `.cairn/settings.json`. Deny rules are checked first and match every alias of a path (relative, absolute, `..`, or a symlink). Plan mode restrictions apply even when an allow rule matches. A trailing `*` matches by prefix. Allow rules in a project's own settings, and MCP servers it defines, only take effect after you run `/trust-project`. Editing those files revokes the trust.
 
 ```json
 {
@@ -147,7 +150,7 @@ Cairn includes its own MCP client, which talks JSON-RPC over stdio. Configure se
 }
 ```
 
-Each discovered tool is exposed to the model as `mcp__<server>__<tool>`. A server that fails to start or respond within 15 seconds is skipped, and the other servers keep working. If a server crashes mid-call, the call fails right away instead of hanging.
+No server process starts without your approval. Each discovered tool is exposed to the model as `mcp__<server>__<tool>`, and each call times out after 60 seconds. A server that fails to start or respond within 15 seconds is skipped, and the other servers keep working. If a server crashes mid-call, the call fails right away instead of hanging.
 
 ## Running tests
 
@@ -159,22 +162,38 @@ python -m pytest
 ## Project layout
 
 ```text
-.cairn/skills/       # Project-level skills (example: code_review)
+.cairn/skills/            # Project-level skills (example: code_review)
 agents/
-├── agent.py         # Agent runtime: model calls, tool dispatch, context compression
-├── frontmatter.py   # YAML frontmatter parser for memory and skill files
-├── main.py          # CLI entry point, argument parsing, and interactive REPL
-├── mcp_client.py    # Stdio JSON-RPC MCP client and tool routing
-├── memory.py        # Per-project long-term memory with relevance-based recall
-├── online_skill_eval.py  # Replay-based evaluation and champion promotion for evolved skills
-├── online_skill_evolution.py  # Extract skill candidates from live feedback and decide add, merge, or discard
-├── prompt.py        # Dynamic system prompt assembly (environment, rules, memory, skills, agents)
-├── session.py       # Session save, load, and resume
-├── session_memory.py  # Fold long conversations into structured episode, working, and tool memory
-├── skill_evolution.py  # Skill persistence, version snapshots, usage stats, and pruning
-├── skills.py        # Skill loading, retrieval, and prompt rendering
-├── subagent.py      # Built-in and custom sub-agent definitions with scoped tool sets
-├── tools.py         # Built-in tools (file I/O, edit, search, shell) and permission checks
-└── ui.py            # Terminal UI: colored output, spinner, tool display
-tests/               # pytest suite
+├── main.py               # CLI entry point and interactive REPL
+├── agent.py              # Agent runtime shared by the Anthropic and OpenAI backends
+├── config.py             # Startup configuration: keys, endpoints, model, limits, pricing
+├── tool_runtime.py       # Tool validation and permission checks for both protocols
+├── checkpoints.py        # Durable records around tool calls for safe recovery
+├── streaming.py          # Keeps failed stream attempts out of answers
+├── context_runtime.py    # Context preflight and bounded memory recall
+├── tool_results.py       # Budgeting, snipping, and idle clearing of old tool results
+├── session_memory.py     # Folding long conversations into structured memory
+├── tools.py              # File, search, and shell tools with permission rules
+├── tool_schemas.py       # Tool definitions exposed to the model
+├── tool_status.py        # Tool results with an explicit failure flag
+├── result_storage.py     # Saves oversized tool output once, keeps previews in context
+├── project_trust.py      # Trust records for project-level settings
+├── mcp_client.py         # Stdio JSON-RPC MCP client
+├── memory.py             # Per-project long-term memory
+├── session.py            # Session save, resume, and titles
+├── skills.py             # Skill loading, retrieval, and prompt rendering
+├── skill_evolution.py    # Skill writes, version snapshots, usage stats, pruning
+├── online_skill_evolution.py  # Extracts skill candidates from live feedback
+├── skill_candidates.py   # Staged proposals, publishing, and rollback
+├── online_skill_eval.py  # Reviewed replay evaluation and champion selection
+├── background_jobs.py    # Bounded queue for background skill learning
+├── provenance_reader.py  # Incremental index over the evolution log
+├── maintenance.py        # Safe cleanup of old local state
+├── storage.py            # Atomic writes and cross-process locks
+├── validation.py         # Local JSON Schema validation
+├── prompt.py             # System prompt assembly
+├── subagent.py           # Built-in and custom sub-agents
+├── frontmatter.py        # YAML frontmatter parser
+└── ui.py                 # Terminal UI
+tests/                    # pytest suite
 ```
