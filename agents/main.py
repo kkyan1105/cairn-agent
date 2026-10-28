@@ -7,11 +7,15 @@ import asyncio
 import os
 import signal
 import sys
-from urllib.parse import urlparse
-
-from dotenv import find_dotenv, load_dotenv
+import threading
+from pathlib import Path
 
 from .agent import Agent
+from .config import (
+    load_env_file as _load_env_file,
+    resolve_api_config as _resolve_api_config,
+    resolve_agent_options,
+)
 from .ui import (
     print_welcome,
     print_user_prompt,
@@ -26,6 +30,8 @@ from .ui import (
     print_warning,
 )
 from .session import load_session, get_latest_session_id
+from .skill_evolution import restore_pruned_skill
+from .tools import check_permission
 from .memory import list_memories
 from .skills import (
     create_skill,
@@ -53,9 +59,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--thinking", action="store_true", help="Enable extended thinking")
     parser.add_argument("--model", "-m", default=None, help="Model to use")
     parser.add_argument("--api-base", default=None, help="OpenAI-compatible API base URL")
-    parser.add_argument("--resume", action="store_true", help="Resume last session")
+    parser.add_argument("--resume", action="store_true", help="Resume latest session in this project")
+    parser.add_argument("--resume-id", help="Resume a specific session in this project")
+    parser.add_argument("--input-price", type=float, default=None, help="Estimated USD per million input tokens")
+    parser.add_argument("--output-price", type=float, default=None, help="Estimated USD per million output tokens")
     parser.add_argument("--max-cost", type=float, default=None, help="Max USD spend")
     parser.add_argument("--max-turns", type=int, default=None, help="Max agentic turns")
+    parser.add_argument("--context-window", type=int, default=None, help="Model context capacity in tokens")
     parser.add_argument("--no-folding", action="store_true", help="Disable full session folding")
     parser.add_argument("--fold-threshold", type=float, default=0.70, help="Auto-fold at this fraction of the context window")
     parser.add_argument("--help", "-h", action="store_true", help="Show help")
@@ -74,63 +84,71 @@ def _resolve_permission_mode(args: argparse.Namespace) -> str:
     return "default"
 
 
-def _clean_env(value: str | None) -> str | None:
-    if value is None:
-        return None
-    value = value.strip()
-    return value or None
+_pending_input: asyncio.Future | None = None
 
 
-def _load_env_file() -> None:
-    env_path = find_dotenv(usecwd=True)
-    if env_path:
-        load_dotenv(env_path, override=False)
-    else:
-        load_dotenv(override=False)
+async def _read_repl_input(prompt: str = "") -> str:
+    """Let background tasks run while stdin waits; don't keep exit alive on stdin."""
+    global _pending_input
+    loop = asyncio.get_running_loop()
+    if _pending_input is not None and _pending_input.get_loop() is loop:
+        pending = _pending_input
+        try:
+            value = await asyncio.shield(pending)
+        except asyncio.CancelledError:
+            raise
+        except BaseException:
+            _pending_input = None
+            raise
+        _pending_input = None
+        return value
+    result = _pending_input = loop.create_future()
 
+    def complete(value: str | None, error: BaseException | None) -> None:
+        if not result.done():
+            if error is not None:
+                result.set_exception(error)
+            else:
+                result.set_result(value)
 
-def _is_anthropic_compatible_base_url(base_url: str | None) -> bool:
-    if not base_url:
-        return False
-    parsed = urlparse(base_url)
-    path = (parsed.path or "").lower().rstrip("/")
-    return path.endswith("/anthropic") or "/anthropic/" in path
+    def read() -> None:
+        value, error = None, None
+        try:
+            value = input(prompt) if prompt else input()
+        except (EOFError, OSError) as exc:
+            error = exc
+        try:
+            loop.call_soon_threadsafe(complete, value, error)
+        except RuntimeError:
+            pass  # The loop may already have closed after cancellation/exit.
 
-
-def _resolve_api_config(cli_api_base: str | None) -> tuple[str | None, str | None, bool]:
-    generic_api_key = _clean_env(os.environ.get("APIKEY")) or _clean_env(os.environ.get("CAIRN_API_KEY"))
-    openai_api_key = _clean_env(os.environ.get("OPENAI_API_KEY"))
-    anthropic_api_key = _clean_env(os.environ.get("ANTHROPIC_API_KEY"))
-
-    generic_api_base = _clean_env(os.environ.get("API")) or _clean_env(os.environ.get("CAIRN_API_BASE"))
-    openai_api_base = _clean_env(os.environ.get("OPENAI_BASE_URL"))
-    anthropic_api_base = _clean_env(os.environ.get("ANTHROPIC_BASE_URL"))
-
-    resolved_api_base = _clean_env(cli_api_base) or generic_api_base or openai_api_base or anthropic_api_base
-
-    if resolved_api_base:
-        if _is_anthropic_compatible_base_url(resolved_api_base):
-            return resolved_api_base, generic_api_key or anthropic_api_key or openai_api_key, False
-        return resolved_api_base, generic_api_key or openai_api_key or anthropic_api_key, True
-
-    if anthropic_api_key or anthropic_api_base:
-        return anthropic_api_base, generic_api_key or anthropic_api_key or openai_api_key, False
-
-    if openai_api_key or openai_api_base:
-        return openai_api_base, generic_api_key or openai_api_key or anthropic_api_key, True
-
-    if generic_api_key:
-        return None, generic_api_key, False
-
-    return None, None, False
+    threading.Thread(target=read, daemon=True).start()
+    try:
+        value = await asyncio.shield(result)
+    except asyncio.CancelledError:
+        raise
+    except BaseException:
+        _pending_input = None
+        raise
+    _pending_input = None
+    return value
 
 
 async def run_repl(agent: Agent) -> None:
+    previous_handler = signal.getsignal(signal.SIGINT)
+    try:
+        await _run_repl(agent)
+    finally:
+        signal.signal(signal.SIGINT, previous_handler)
+        await agent.aclose()
+
+
+async def _run_repl(agent: Agent) -> None:
     """Interactive REPL loop."""
 
     async def confirm_fn(message: str) -> bool:
         try:
-            answer = input("  Allow? (y/n): ")
+            answer = await _read_repl_input("  Allow? (y/n): ")
             return answer.lower().startswith("y")
         except EOFError:
             return False
@@ -142,9 +160,9 @@ async def run_repl(agent: Agent) -> None:
         print_plan_approval_options()
         while True:
             try:
-                choice = input("  Enter choice (1-4): ").strip()
+                choice = (await _read_repl_input("  Enter choice (1-4): ")).strip()
             except EOFError:
-                return {"choice": "manual-execute"}
+                return {"choice": "cancel"}
             if choice == "1":
                 return {"choice": "clear-and-execute"}
             elif choice == "2":
@@ -153,7 +171,7 @@ async def run_repl(agent: Agent) -> None:
                 return {"choice": "manual-execute"}
             elif choice == "4":
                 try:
-                    feedback = input("  Feedback (what to change): ").strip()
+                    feedback = (await _read_repl_input("  Feedback (what to change): ")).strip()
                 except EOFError:
                     feedback = ""
                 return {"choice": "keep-planning", "feedback": feedback or None}
@@ -166,7 +184,7 @@ async def run_repl(agent: Agent) -> None:
 
     def handle_sigint(sig, frame):
         nonlocal sigint_count
-        if agent._aborted is False and agent._output_buffer is not None:
+        if agent.is_processing:
             # Agent is processing
             agent.abort()
             print_interrupted()
@@ -186,7 +204,7 @@ async def run_repl(agent: Agent) -> None:
     while True:
         print_user_prompt()
         try:
-            line = input()
+            line = await _read_repl_input()
         except (EOFError, KeyboardInterrupt):
             print_goodbye()
             break
@@ -203,6 +221,27 @@ async def run_repl(agent: Agent) -> None:
         # REPL commands
         if inp == "/clear":
             agent.clear_history()
+            continue
+        if inp == "/trust-project":
+            from .project_trust import trust_project
+            try:
+                trust_project()
+                print_info(f"Trusted project configuration: {Path.cwd().resolve()}")
+            except (ValueError, OSError) as exc:
+                print_error(str(exc))
+            continue
+        if inp.startswith("/cleanup-state"):
+            from .maintenance import cleanup_state
+            try:
+                parts = inp.split()[1:]
+                apply = "--apply" in parts
+                days = next((int(part) for part in parts if part != "--apply"), 30)
+                preview = cleanup_state(days)
+                print_info(str(preview))
+                if apply and await agent.authorize_operation("state_cleanup", preview):
+                    print_info(str(cleanup_state(days, apply=True, expected_paths=preview["paths"])))
+            except (ValueError, OSError) as exc:
+                print_error(str(exc))
             continue
         if inp == "/plan":
             agent.toggle_plan_mode()
@@ -230,12 +269,63 @@ async def run_repl(agent: Agent) -> None:
             else:
                 print_skill_entries(skills)
             continue
+        if inp == "/skill-candidates":
+            from .skill_candidates import list_candidates
+            try:
+                for proposal in list_candidates():
+                    print_info(f"{proposal['id']} | {proposal['status']} | {proposal['action']} {proposal['skill']}\n"
+                               f"{proposal['write_input'].get('instructions', '')}")
+            except (ValueError, OSError, KeyError, TypeError) as exc:
+                print_error(str(exc))
+            continue
+        if inp.startswith("/skill-apply "):
+            from .skill_candidates import read_candidate, apply_candidate
+            try:
+                candidate_id = inp[len("/skill-apply "):].strip()
+                parts = candidate_id.split()
+                if not parts or len(parts) > 2 or (len(parts) == 2 and parts[1] != "--manual-review"):
+                    raise ValueError("Usage: /skill-apply <id> [--manual-review]")
+                candidate_id = parts[0]
+                proposal = read_candidate(candidate_id)
+                import hashlib
+                import json
+                proposal_hash = hashlib.sha256(json.dumps(proposal, sort_keys=True).encode()).hexdigest()
+                print_info(f"Publish proposed Skill {proposal['skill']}:\n{proposal['write_input'].get('instructions', '')}")
+                operation = "skill_evolve" if proposal["action"] == "merge" else "skill_create"
+                if await agent.authorize_operation(operation, proposal["write_input"]):
+                    result = apply_candidate(candidate_id, manual_review="--manual-review" in parts, expected_hash=proposal_hash)
+                    print_info(str(result))
+                    agent._refresh_runtime_system_prompt()
+                else:
+                    print_info("Skill publication denied.")
+            except (ValueError, OSError) as exc:
+                print_error(str(exc))
+            continue
+        if inp.startswith("/skill-rollback "):
+            from .skill_candidates import rollback_skill
+            name = inp[len("/skill-rollback "):].strip()
+            if await agent.authorize_operation("skill_evolve", {"skill_name": name}):
+                try:
+                    print_info(str(rollback_skill(name)))
+                    agent._refresh_runtime_system_prompt()
+                except (ValueError, OSError, KeyError, TypeError) as exc:
+                    print_error(str(exc))
+            else:
+                print_info("Skill rollback denied.")
+            continue
         if inp == "/skill-stats":
             print_info(skill_stats())
             continue
         if inp == "/skill-eval":
-            side_query = agent._build_side_query(max_tokens=2400)
-            print_info(await format_online_skill_eval_async(side_query=side_query))
+            try:
+                # Finish pending writes before reading provenance and active snapshots.
+                await agent.drain_background_skill_tasks()
+                side_query = agent._build_side_query(max_tokens=2400, require_complete=True)
+                judge_model = os.environ.get("CAIRN_SKILL_JUDGE_MODEL")
+                judge_query = agent._build_side_query(max_tokens=2400, require_complete=True, model_override=judge_model) if judge_model else None
+                print_info(await format_online_skill_eval_async(side_query=side_query, judge_side_query=judge_query))
+            except (ValueError, OSError) as exc:
+                print_error(f"Skill evaluation could not complete: {exc}")
             continue
         if inp.startswith("/extract_now"):
             hint = inp[len("/extract_now") :].strip()
@@ -261,17 +351,43 @@ async def run_repl(agent: Agent) -> None:
             if len(parts) < 2:
                 print_error("Usage: /skill-evolve <skill-name> <durable lesson>")
                 continue
+            if not await agent.authorize_operation("skill_evolve", {"skill_name": parts[0], "lesson": parts[1]}):
+                print_info("Skill evolution denied.")
+                continue
             result = evolve_skill(parts[0], parts[1], rationale="Manual REPL evolution", target="active")
             if result.get("ok"):
                 print_info(f"Evolved skill {result.get('skill')} to version {result.get('version')}")
             else:
                 print_error(str(result.get("error") or result))
             continue
+        if inp.startswith("/skill-restore "):
+            name = inp[len("/skill-restore "):].strip()
+            permission = check_permission("skill_restore", {"skill_name": name}, agent.permission_mode)
+            if permission["action"] == "deny" or (permission["action"] == "confirm" and
+                    not await agent._confirm_tool_call("skill_restore", permission)):
+                print_info("Skill restoration denied.")
+                continue
+            try:
+                result = restore_pruned_skill(name)
+                if result.get("ok"):
+                    from .skills import reset_skill_cache
+                    reset_skill_cache()
+                    agent._refresh_runtime_system_prompt()
+                    print_info(f"Restored skill: {name}")
+                else:
+                    print_error(str(result.get("error")))
+            except (ValueError, OSError) as exc:
+                print_error(f"Skill restoration failed: {exc}")
+            continue
         if inp.startswith("/skill-create "):
             _, rest = inp.split(" ", 1)
             parts = [part.strip() for part in rest.split("|", 3)]
             if len(parts) < 4 or not all(parts[:4]):
                 print_error("Usage: /skill-create <name> | <description> | <when-to-use> | <instructions>")
+                continue
+            if not await agent.authorize_operation("skill_create", {"name": parts[0], "description": parts[1],
+                    "when_to_use": parts[2], "instructions": parts[3], "target": "project"}):
+                print_info("Skill creation denied.")
                 continue
             result = create_skill(
                 name=parts[0],
@@ -317,7 +433,6 @@ async def run_repl(agent: Agent) -> None:
         except Exception as e:
             if "abort" not in str(e).lower():
                 print_error(str(e))
-    await agent.drain_background_skill_tasks()
 
 
 async def run_one_shot(agent: Agent, prompt: str) -> None:
@@ -330,9 +445,8 @@ async def run_one_shot(agent: Agent, prompt: str) -> None:
 
     try:
         await agent.chat(prompt)
-        await agent.drain_background_skill_tasks()
     finally:
-        await agent._mcp_manager.disconnect_all()
+        await agent.aclose()
 
 
 def main() -> None:
@@ -349,14 +463,18 @@ Usage: cairn [options] [prompt]
 Options:
   --yolo, -y          Skip all confirmation prompts (bypassPermissions mode)
   --plan              Plan mode: read-only, describe changes without executing
-  --accept-edits      Auto-approve file edits, still confirm dangerous shell
+  --accept-edits      Auto-approve file edits, still confirm every shell command
   --dont-ask          Auto-deny anything needing confirmation (for CI)
   --thinking          Enable extended thinking (Anthropic only)
   --model, -m         Model to use (default: deepseek-chat, or MODEL env)
   --api-base URL      Override API base URL from CLI or .env
-  --resume            Resume the last session
+  --resume            Resume the latest session in the current project
+  --resume-id ID      Resume a specific session in the current project
+  --input-price USD   Estimated price per million input tokens (default: 3)
+  --output-price USD  Estimated price per million output tokens (default: 15)
   --max-cost USD      Stop when estimated cost exceeds this amount
   --max-turns N       Stop after N agentic turns
+  --context-window N Model context capacity in tokens
   --no-folding        Disable full session folding
   --fold-threshold X  Auto-fold threshold (0 < X < 1, default: 0.70)
   --help, -h          Show this help
@@ -373,7 +491,13 @@ REPL commands:
   /extract_now        Extract the current pending online skill window: /extract_now [hint]
   /skill-feedback     Record feedback: /skill-feedback <skill> <rating> [note]
   /skill-evolve       Evolve a skill: /skill-evolve <skill> <durable lesson>
+  /skill-restore      Restore an archived skill: /skill-restore <skill>
   /skill-create       Create a skill: /skill-create <name> | <description> | <when-to-use> | <instructions>
+  /skill-candidates   Review isolated online Skill proposals
+  /skill-apply        Publish a passed candidate: /skill-apply <id> [--manual-review]
+  /skill-rollback     Restore the most recent snapshot: /skill-rollback <skill>
+  /trust-project      Trust current project permission/MCP configuration
+  /cleanup-state      Preview old artifacts: /cleanup-state [days] [--apply]
   /<skill-name>       Invoke a skill (e.g. /commit "fix types")
 
 Examples:
@@ -390,12 +514,10 @@ Examples:
 
     # Map the command-line boolean flags to the permission mode used inside the Agent.
     permission_mode = _resolve_permission_mode(args)
-    # Model: prefer the CLI arg, then MODEL from .env, finally fall back to the default model.
-    model = args.model or os.environ.get("MODEL") or "deepseek-chat"
-    resolved_api_base, resolved_api_key, resolved_use_openai = _resolve_api_config(args.api_base)
+    api_config = _resolve_api_config(args.api_base)
 
     # Without an API key the model can't be called, so print setup instructions and exit.
-    if not resolved_api_key:
+    if not api_config[1]:
         print_error(
             "API key is required.\n"
             "  Set APIKEY (+ optional API) in .env for generic config,\n"
@@ -406,29 +528,33 @@ Examples:
 
     # Create the main Agent. OpenAI-compatible and native Anthropic APIs take the base URL under different parameter names.
     agent = Agent(
+        **resolve_agent_options(
+            api_config=api_config,
+            model=args.model,
+            input_price=args.input_price,
+            output_price=args.output_price,
+            context_window=args.context_window,
+        ),
         permission_mode=permission_mode,
-        model=model,
         thinking=args.thinking,
         max_cost_usd=args.max_cost,
         max_turns=args.max_turns,
-        api_base=resolved_api_base if resolved_use_openai else None,
-        anthropic_base_url=resolved_api_base if not resolved_use_openai else None,
-        api_key=resolved_api_key,
         enable_folding=not args.no_folding,
         auto_compact_threshold=args.fold_threshold,
     )
 
     # Resume session
     # --resume loads the most recent session and restores its message history into the new Agent.
-    if args.resume:
-        session_id = get_latest_session_id()
+    if args.resume or args.resume_id:
+        session_id = args.resume_id or get_latest_session_id()
         if session_id:
             session = load_session(session_id)
             if session:
-                agent.restore_session({
-                    "anthropicMessages": session.get("anthropicMessages"),
-                    "openaiMessages": session.get("openaiMessages"),
-                })
+                try:
+                    agent.restore_session(session)
+                except ValueError as exc:
+                    print_error(str(exc))
+                    return
             else:
                 print_info("No session found to resume.")
         else:

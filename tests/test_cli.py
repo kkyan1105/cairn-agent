@@ -44,7 +44,9 @@ def test_prompt_and_folding_flags(monkeypatch):
     ],
 )
 def test_anthropic_base_url_detection(url, expected):
-    assert cli._is_anthropic_compatible_base_url(url) is expected
+    from agents.config import _is_anthropic_compatible_base_url
+
+    assert _is_anthropic_compatible_base_url(url) is expected
 
 
 def test_generic_config_with_anthropic_url(clean_env):
